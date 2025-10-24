@@ -46,6 +46,24 @@ class CtcTest(unittest.TestCase):
         self.assertEqual(greedy, "AB")
         self.assertEqual(beam, "AB")
 
+    def test_ctc_loss_with_grad_matches_scalar(self) -> None:
+        logits = [
+            [2.0, 1.0, 0.1],
+            [0.5, 3.0, 0.1],
+            [0.2, 0.3, 2.5],
+        ]
+        target = [1, 2]
+        loss = ctc.ctc_loss(logits, target, blank=0)
+        loss_grad, grad = ctc.ctc_loss_with_grad(logits, target, blank=0)
+        self.assertAlmostEqual(loss, loss_grad, places=6)
+        self.assertEqual(len(grad), len(logits))
+        self.assertEqual(len(grad[0]), len(logits[0]))
+
+    def test_symbol_table_contains_punctuation(self) -> None:
+        symbols = ctc.symbol_table()
+        self.assertIn(".", symbols)
+        self.assertIn("!", symbols)
+
 
 if __name__ == "__main__":
     unittest.main()

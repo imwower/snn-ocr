@@ -8,13 +8,18 @@ Logits = Sequence[Sequence[float]]
 Indices = Sequence[int]
 
 _NEG_INF = float("-inf")
-_SYMBOL_TABLE: Sequence[str] = (
-    [""]  # placeholder for blank at index 0
+SYMBOLS: Tuple[str, ...] = tuple(
+    [""]  # blank at index 0
     + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     + list("abcdefghijklmnopqrstuvwxyz")
     + list("0123456789")
-    + [" "]
+    + [" ", ".", ",", "!", "?"]
 )
+
+
+def symbol_table() -> Tuple[str, ...]:
+    """Expose the static symbol table (blank-inclusive)."""
+    return SYMBOLS
 
 
 def _log_sum_exp(a: float, b: float) -> float:
@@ -54,8 +59,9 @@ def _extend_with_blanks(target: Sequence[int], blank: int) -> List[int]:
     return extended
 
 
-def ctc_loss(logits: Logits, target: Sequence[int], blank: int = 0) -> float:
-    """Compute the negative log-likelihood of target under the CTC objective."""
+def _ctc_forward(
+    logits: Logits, target: Sequence[int], blank: int
+) -> Tuple[List[List[float]], List[int], List[List[float]], float, float]:
     if not logits:
         raise ValueError("logits must be non-empty")
     log_probs = [_log_softmax_row(frame) for frame in logits]
@@ -69,20 +75,81 @@ def ctc_loss(logits: Logits, target: Sequence[int], blank: int = 0) -> float:
     for t in range(1, T):
         for s in range(S):
             current_symbol = extended[s]
-            total = alpha[t - 1][s]
+            terms = [alpha[t - 1][s]]
             if s - 1 >= 0:
-                total = _log_sum_exp(total, alpha[t - 1][s - 1])
+                terms.append(alpha[t - 1][s - 1])
             if (
                 s - 2 >= 0
                 and current_symbol != blank
                 and current_symbol != extended[s - 2]
             ):
-                total = _log_sum_exp(total, alpha[t - 1][s - 2])
+                terms.append(alpha[t - 1][s - 2])
+            total = _log_sum_exp_list(terms)
             alpha[t][s] = log_probs[t][current_symbol] + total
     final_candidates = [alpha[-1][S - 1]]
     if S > 1:
         final_candidates.append(alpha[-1][S - 2])
-    return -_log_sum_exp_list(final_candidates)
+    log_likelihood = _log_sum_exp_list(final_candidates)
+    loss = -log_likelihood
+    return log_probs, extended, alpha, loss, log_likelihood
+
+
+def ctc_loss(logits: Logits, target: Sequence[int], blank: int = 0) -> float:
+    """Compute the negative log-likelihood of target under the CTC objective."""
+    _, _, _, loss, _ = _ctc_forward(logits, target, blank)
+    return loss
+
+
+def ctc_loss_with_grad(
+    logits: Logits, target: Sequence[int], blank: int = 0
+) -> Tuple[float, List[List[float]]]:
+    """CTC loss and gradient w.r.t. logits."""
+    log_probs, extended, alpha, loss, log_likelihood = _ctc_forward(
+        logits, target, blank
+    )
+    T = len(log_probs)
+    S = len(extended)
+    num_classes = len(log_probs[0])
+    beta = [[_NEG_INF for _ in range(S)] for _ in range(T)]
+    beta[T - 1][S - 1] = 0.0
+    if S > 1:
+        beta[T - 1][S - 2] = 0.0
+    for t in range(T - 2, -1, -1):
+        for s in range(S):
+            transitions: List[float] = []
+            symbol_s = extended[s]
+            # stay
+            if beta[t + 1][s] != _NEG_INF:
+                transitions.append(beta[t + 1][s] + log_probs[t + 1][symbol_s])
+            # move to s+1
+            if s + 1 < S and beta[t + 1][s + 1] != _NEG_INF:
+                transitions.append(beta[t + 1][s + 1] + log_probs[t + 1][extended[s + 1]])
+            # skip over blank
+            if (
+                s + 2 < S
+                and extended[s] != blank
+                and extended[s] != extended[s + 2]
+                and beta[t + 1][s + 2] != _NEG_INF
+            ):
+                transitions.append(beta[t + 1][s + 2] + log_probs[t + 1][extended[s + 2]])
+            beta[t][s] = _log_sum_exp_list(transitions) if transitions else _NEG_INF
+    probs = [[math.exp(value) for value in row] for row in log_probs]
+    grad = [[probs[t][k] for k in range(num_classes)] for t in range(T)]
+    for t in range(T):
+        posterior_by_symbol = [0.0 for _ in range(num_classes)]
+        for s in range(S):
+            symbol = extended[s]
+            if symbol >= num_classes:
+                continue
+            alpha_ts = alpha[t][s]
+            beta_ts = beta[t][s]
+            if alpha_ts == _NEG_INF or beta_ts == _NEG_INF:
+                continue
+            posterior = math.exp(alpha_ts + beta_ts - log_likelihood)
+            posterior_by_symbol[symbol] += posterior
+        for k in range(num_classes):
+            grad[t][k] -= posterior_by_symbol[k]
+    return loss, grad
 
 
 def _collapse_repeats(indices: Sequence[int], blank: int) -> List[int]:
@@ -102,8 +169,8 @@ def _collapse_repeats(indices: Sequence[int], blank: int) -> List[int]:
 def _index_to_symbol(index: int, blank: int) -> str:
     if index == blank:
         return ""
-    if index < len(_SYMBOL_TABLE):
-        return _SYMBOL_TABLE[index]
+    if index < len(SYMBOLS):
+        return SYMBOLS[index]
     return str(index)
 
 
@@ -177,6 +244,9 @@ def _self_check() -> None:
     target = [1, 2]
     loss = ctc_loss(logits, target, blank=0)
     assert loss > 0
+    loss2, grad = ctc_loss_with_grad(logits, target, blank=0)
+    assert abs(loss - loss2) < 1e-6
+    assert len(grad) == len(logits)
     greedy = greedy_decode(logits, blank=0)
     beam = beam_search(logits, beam=3, blank=0)
     assert greedy == beam
