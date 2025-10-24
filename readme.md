@@ -1,4 +1,5 @@
 SNN‑OCR‑Minimal (Standard Library Only)
+标准库 Only · MIT License · Python 3.10+
 
 一个纯视觉脉冲神经网络（SNN）微型 OCR 原型：不依赖第三方包（如 numpy、Pillow、PyTorch 等），仅使用 Python 标准库 完成数据合成→脉冲编码→SNN 前端→自适应视觉 Token 压缩（OTC）→序列头→CTC 转写→评测的闭环。
 训练方式模仿儿童识字：数字 → 大/小写字母 → 简单词 → 简单句。
