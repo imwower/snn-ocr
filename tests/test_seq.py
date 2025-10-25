@@ -39,14 +39,33 @@ class SequenceHeadTest(unittest.TestCase):
         self.assertEqual(len(attended[0][0]), len(self.sample[0][0]))
 
     def test_spiking_head_handles_attention_toggle(self) -> None:
-        head_attn = seq.SpikingSeqHead(use_attention=True, heads=2)
-        head_no_attn = seq.SpikingSeqHead(use_attention=False)
+        head_attn = seq.SpikingSeqHead(use_attention=True, heads=2, attn_type="linear")
+        head_no_attn = seq.SpikingSeqHead(use_attention=False, attn_type="none")
         out_attn = head_attn.forward(self.sample)
         out_no_attn = head_no_attn.forward(self.sample)
         self.assertEqual(len(out_attn), len(self.sample))
         self.assertEqual(len(out_no_attn[0]), len(self.sample[0]))
         self.assertEqual(len(out_attn[0][0]), len(self.sample[0][0]))
         self.assertEqual(len(out_no_attn[0][0]), len(self.sample[0][0]))
+
+    def test_attention_type_none_matches_disabled(self) -> None:
+        head_disabled = seq.SpikingSeqHead(use_attention=False, attn_type="none")
+        head_none = seq.SpikingSeqHead(use_attention=True, attn_type="none")
+        out_disabled = head_disabled.forward(self.sample)
+        out_none = head_none.forward(self.sample)
+        self.assertEqual(out_disabled, out_none)
+
+    def test_temporal_regularization_positive(self) -> None:
+        head = seq.SpikingSeqHead(use_attention=False, smooth_lambda=0.5, smooth_mode="l2")
+        head.forward(self.sample)
+        self.assertGreaterEqual(head.regularization(), 0.0)
+
+    def test_train_eval_toggles(self) -> None:
+        head = seq.SpikingSeqHead(drop_path=0.5, seed=1)
+        head.eval()
+        self.assertFalse(head.training)
+        head.train()
+        self.assertTrue(head.training)
 
     def test_blockwise_merge_reduces_flat_regions(self) -> None:
         sequence = [[0.1, 0.1, 0.1, 0.1, float(idx)] for idx in range(10)]

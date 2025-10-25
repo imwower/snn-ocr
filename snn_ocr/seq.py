@@ -210,7 +210,7 @@ def merge_columns_blockwise(
 
 
 class SpikingSeqHead:
-    """Two-layer spike sequence head with optional lightweight attention."""
+    """Two-layer spike sequence head with optional attention and stability regularizers."""
 
     def __init__(
         self,
@@ -218,25 +218,95 @@ class SpikingSeqHead:
         use_attention: bool = True,
         heads: int = 2,
         key_dim: int | None = None,
+        *,
+        attn_type: str = "linear",
+        drop_path: float = 0.0,
+        smooth_lambda: float = 0.0,
+        smooth_mode: str = "l2",
+        huber_delta: float = 0.1,
+        seed: int = 0,
     ) -> None:
         self.dw_kernel = dw_kernel
         self.use_attention = use_attention
         self.heads = heads
         self.key_dim = key_dim
+        self.attn_type = attn_type.lower()
+        if self.attn_type not in ("linear", "none"):
+            raise ValueError("attn_type must be 'linear' or 'none'")
+        self.drop_path = max(0.0, min(0.999, drop_path))
+        self.smooth_lambda = max(0.0, smooth_lambda)
+        self.smooth_mode = smooth_mode.lower()
+        if self.smooth_mode not in ("l2", "huber", "none"):
+            raise ValueError("smooth_mode must be 'l2', 'huber', or 'none'")
+        self.huber_delta = max(1e-4, huber_delta)
+        self.training = True
+        self._rng = Random(seed)
+        self._last_temporal_penalty = 0.0
+
+    def train(self) -> None:
+        self.training = True
+
+    def eval(self) -> None:
+        self.training = False
+
+    def regularization(self) -> float:
+        return self._last_temporal_penalty
+
+    def _apply_droppath(self, residual: SequenceTensor, update: SequenceTensor) -> SequenceTensor:
+        if not self.training or self.drop_path <= 0.0:
+            return _residual_norm(residual, update)
+        if self._rng.random() < self.drop_path:
+            return residual
+        keep_prob = 1.0 - self.drop_path
+        scaled: SequenceTensor = []
+        for t in range(len(update)):
+            step: List[List[float]] = []
+            for w in range(len(update[t])):
+                step.append([value / keep_prob for value in update[t][w]])
+            scaled.append(step)
+        return _residual_norm(residual, scaled)
+
+    def _temporal_penalty(self, seq: SequenceTensor) -> float:
+        if self.smooth_lambda <= 0.0 or self.smooth_mode == "none":
+            return 0.0
+        T, W, C = _validate_seq(seq)
+        if T < 2:
+            return 0.0
+        total = 0.0
+        count = 0
+        delta = self.huber_delta
+        for t in range(1, T):
+            prev = seq[t - 1]
+            curr = seq[t]
+            for w in range(W):
+                for c in range(C):
+                    diff = curr[w][c] - prev[w][c]
+                    if self.smooth_mode == "huber":
+                        abs_diff = abs(diff)
+                        if abs_diff <= delta:
+                            total += 0.5 * diff * diff
+                        else:
+                            total += delta * (abs_diff - 0.5 * delta)
+                    else:
+                        total += diff * diff
+                    count += 1
+        return self.smooth_lambda * total / max(1, count)
 
     def forward(self, seq: SequenceTensor, *, use_attention: bool | None = None) -> SequenceTensor:
         _validate_seq(seq)
-        attn_enabled = self.use_attention if use_attention is None else use_attention
+        attn_requested = self.use_attention if use_attention is None else use_attention
+        attn_mode = self.attn_type if attn_requested else "none"
         x = seq
         for _ in range(2):
             conv = dwconv1d_spike(x, k=self.dw_kernel)
-            x = _residual_norm(x, conv)
+            x = self._apply_droppath(x, conv)
             pw = pointwise_spike(x)
-            if attn_enabled:
+            if attn_mode == "linear":
                 attn = linear_attention(pw, heads=self.heads, key_dim=self.key_dim)
-                x = _residual_norm(pw, attn)
+                x = self._apply_droppath(pw, attn)
             else:
                 x = _layer_norm(pw)
+        self._last_temporal_penalty = self._temporal_penalty(x)
         return x
 
 
@@ -255,20 +325,47 @@ def _self_check() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
     _self_check()
-    rng = Random(0)
-    T, W, C = 3, 8, 4
-    seq_input: SequenceTensor = []
-    for _ in range(T):
-        step: List[List[float]] = []
-        for _ in range(W):
-            step.append([rng.uniform(-1.0, 1.0) for _ in range(C)])
-        seq_input.append(step)
 
-    head_with_attn = SpikingSeqHead(dw_kernel=3, use_attention=True, heads=2)
-    output_attn = head_with_attn.forward(seq_input)
-    print(f"[with attention] T={len(output_attn)}, W={len(output_attn[0])}, C={len(output_attn[0][0])}")
+    parser = argparse.ArgumentParser(description="Spiking sequence head stability demo.")
+    parser.add_argument("--attn", choices=["none", "linear"], default="linear")
+    parser.add_argument("--steps", type=int, default=100, help="Number of random forward passes.")
+    parser.add_argument("--drop-path", type=float, default=0.0, help="DropPath rate during training.")
+    parser.add_argument("--smooth", type=float, default=0.0, help="Temporal smoothing weight.")
+    parser.add_argument("--smooth-mode", choices=["l2", "huber", "none"], default="l2")
+    parser.add_argument("--seed", type=int, default=0)
+    args = parser.parse_args()
 
-    head_no_attn = SpikingSeqHead(dw_kernel=5, use_attention=False)
-    output_no_attn = head_no_attn.forward(seq_input)
-    print(f"[no attention]  T={len(output_no_attn)}, W={len(output_no_attn[0])}, C={len(output_no_attn[0][0])}")
+    rng = Random(args.seed)
+    head = SpikingSeqHead(
+        dw_kernel=3,
+        use_attention=True,
+        heads=2,
+        attn_type=args.attn,
+        drop_path=args.drop_path,
+        smooth_lambda=args.smooth,
+        smooth_mode=args.smooth_mode,
+        seed=args.seed + 42,
+    )
+    head.train()
+    max_abs = 0.0
+    for step_idx in range(args.steps):
+        seq_input: SequenceTensor = []
+        for _ in range(3):
+            step: List[List[float]] = []
+            for _ in range(8):
+                step.append([rng.uniform(-1.0, 1.0) for _ in range(4)])
+            seq_input.append(step)
+        output = head.forward(seq_input)
+        for frame in output:
+            for column in frame:
+                for value in column:
+                    max_abs = max(max_abs, abs(value))
+        if math.isnan(max_abs):
+            raise RuntimeError("Numerical instability detected.")
+    print(
+        f"Demo complete (attn={args.attn}, drop_path={args.drop_path}, smooth={args.smooth}): "
+        f"max|value|={max_abs:.4f}, last_reg={head.regularization():.6f}"
+    )
