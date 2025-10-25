@@ -64,6 +64,35 @@ class CtcTest(unittest.TestCase):
         self.assertIn(".", symbols)
         self.assertIn("!", symbols)
 
+    def test_ctc_loss_handles_empty_target(self) -> None:
+        logits = [
+            [5.0, 0.5],
+            [4.5, 0.2],
+            [5.2, 0.1],
+        ]
+        loss = ctc.ctc_loss(logits, [], blank=0)
+        self.assertLess(loss, 0.05)
+
+    def test_decoders_return_empty_for_all_blank(self) -> None:
+        logits = [
+            [4.0, 0.5, 0.2],
+            [4.3, 0.1, 0.2],
+            [4.1, 0.2, 0.1],
+        ]
+        self.assertEqual(ctc.greedy_decode(logits, blank=0), "")
+        self.assertEqual(ctc.beam_search(logits, beam=2, blank=0), "")
+
+    def test_repeated_characters_require_blank_gap(self) -> None:
+        logits = [
+            [0.2, 3.0, 0.1],
+            [3.2, 0.5, 0.1],
+            [0.2, 3.1, 0.1],
+        ]
+        decoded_greedy = ctc.greedy_decode(logits, blank=0)
+        decoded_beam = ctc.beam_search(logits, beam=3, blank=0)
+        self.assertEqual(decoded_greedy, "AA")
+        self.assertEqual(decoded_beam, "AA")
+
 
 if __name__ == "__main__":
     unittest.main()

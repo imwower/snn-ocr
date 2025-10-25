@@ -29,7 +29,7 @@ MODULE_MATRIX: Sequence[Tuple[str, Sequence[str]]] = (
     ("render", ("render_text",)),
     ("synth", ("generate_dataset",)),
     ("spikes", ("encode_ttfs", "encode_poisson")),
-    ("lif", ("LIF", "conv2d_spike")),
+    ("lif", ("LIF", "conv2d_spike", "conv1d_spike")),
     ("otc", ("compress_height",)),
     ("seq", ("dwconv1d_spike",)),
     ("ctc", ("ctc_loss", "beam_search")),
