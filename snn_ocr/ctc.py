@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, List, Sequence, Tuple
+from random import Random
+from typing import Dict, List, Sequence, Tuple
 
 Logits = Sequence[Sequence[float]]
 Indices = Sequence[int]
@@ -22,26 +23,16 @@ def symbol_table() -> Tuple[str, ...]:
     return SYMBOLS
 
 
-def log_sum_exp(a: float, b: float) -> float:
-    """Stable two-term log-sum-exp used throughout forward/backward passes."""
-    if a == _NEG_INF:
-        return b
-    if b == _NEG_INF:
-        return a
-    if a > b:
-        return a + math.log1p(math.exp(b - a))
-    return b + math.log1p(math.exp(a - b))
-
-
-def _log_sum_exp_list(values: Iterable[float]) -> float:
-    iterator = iter(values)
-    try:
-        acc = next(iterator)
-    except StopIteration:
+def log_sum_exp(*values: float) -> float:
+    """Stable log-sum-exp that accepts any number of values."""
+    filtered = [value for value in values if value != _NEG_INF]
+    if not filtered:
         return _NEG_INF
-    for value in iterator:
-        acc = log_sum_exp(acc, value)
-    return acc
+    maximum = max(filtered)
+    if math.isinf(maximum):
+        return maximum
+    total = sum(math.exp(value - maximum) for value in filtered)
+    return maximum + math.log(total)
 
 
 def _log_softmax_row(row: Sequence[float]) -> List[float]:
@@ -93,12 +84,12 @@ def _forward_backward(
                 and current_symbol != extended[s - 2]
             ):
                 terms.append(alpha[t - 1][s - 2])
-            total = _log_sum_exp_list(terms)
+            total = log_sum_exp(*terms)
             alpha[t][s] = log_probs[t][current_symbol] + total
     final_candidates = [alpha[-1][S - 1]]
     if S > 1:
         final_candidates.append(alpha[-1][S - 2])
-    log_likelihood = _log_sum_exp_list(final_candidates)
+    log_likelihood = log_sum_exp(*final_candidates)
     loss = -log_likelihood
 
     beta = [[_NEG_INF for _ in range(S)] for _ in range(T)]
@@ -120,7 +111,7 @@ def _forward_backward(
                 and beta[t + 1][s + 2] != _NEG_INF
             ):
                 transitions.append(beta[t + 1][s + 2] + log_probs[t + 1][extended[s + 2]])
-            beta[t][s] = _log_sum_exp_list(transitions) if transitions else _NEG_INF
+            beta[t][s] = log_sum_exp(*transitions) if transitions else _NEG_INF
     return log_probs, extended, alpha, beta, loss, log_likelihood
 
 
@@ -221,20 +212,21 @@ def beam_search(
     len_norm: bool = True,
     ins_penalty: float = 0.0,
 ) -> str:
-    """CTC beam search decoding with optional length norm and insertion penalty."""
+    """CTC prefix beam search with blank/non-blank states."""
     if beam <= 0:
         raise ValueError("beam must be positive")
     if not logits:
         return ""
     log_probs = [_log_softmax_row(frame) for frame in logits]
-    beams: dict[Tuple[int, ...], Tuple[float, float]] = {(): (0.0, _NEG_INF)}
+    beams: Dict[Tuple[int, ...], Tuple[float, float]] = {(): (0.0, _NEG_INF)}
     for log_prob in log_probs:
-        next_beams: dict[Tuple[int, ...], Tuple[float, float]] = {}
+        next_beams: Dict[Tuple[int, ...], Tuple[float, float]] = {}
         for prefix, (pb, pnb) in beams.items():
             total = log_sum_exp(pb, pnb)
-            current = next_beams.get(prefix, (_NEG_INF, _NEG_INF))
-            new_pb = log_sum_exp(current[0], total + log_prob[blank])
-            next_beams[prefix] = (new_pb, current[1])
+            blank_logp = log_prob[blank]
+            cur_pb, cur_pnb = next_beams.get(prefix, (_NEG_INF, _NEG_INF))
+            cur_pb = log_sum_exp(cur_pb, total + blank_logp)
+            next_beams[prefix] = (cur_pb, cur_pnb)
             for symbol, log_p_symbol in enumerate(log_prob):
                 if symbol == blank:
                     continue
@@ -250,8 +242,7 @@ def beam_search(
                 else:
                     new_prefix = prefix + (symbol,)
                     nb_pb, nb_pnb = next_beams.get(new_prefix, (_NEG_INF, _NEG_INF))
-                    incoming = total + log_p_symbol
-                    nb_pnb = log_sum_exp(nb_pnb, incoming)
+                    nb_pnb = log_sum_exp(nb_pnb, total + log_p_symbol)
                     next_beams[new_prefix] = (nb_pb, nb_pnb)
         beams = dict(
             sorted(
@@ -263,11 +254,10 @@ def beam_search(
 
     def _final_score(entry: Tuple[Tuple[int, ...], Tuple[float, float]]) -> float:
         prefix, (pb, pnb) = entry
-        base = log_sum_exp(pb, pnb)
         length = len(prefix)
+        base = log_sum_exp(pb, pnb) - ins_penalty * length
         if len_norm and length > 0:
-            base /= length
-        base -= ins_penalty * length
+            return base / length
         return base
 
     best_prefix = max(beams.items(), key=_final_score)[0]
@@ -291,23 +281,48 @@ def _self_check() -> None:
     assert greedy == beam
 
 
+def _format_target(target: Sequence[int], blank: int) -> str:
+    if not target:
+        return "<empty>"
+    return "".join(_index_to_symbol(idx, blank) for idx in target)
+
+
+def _demo_case(name: str, logits: List[List[float]], target: Sequence[int]) -> None:
+    loss_value = ctc_loss(logits, target, blank=0)
+    greedy = greedy_decode(logits, blank=0)
+    beam = beam_search(
+        logits,
+        beam=8,
+        blank=0,
+        len_norm=True,
+        ins_penalty=0.05,
+    )
+    print(f"[{name}] target={_format_target(target, blank=0)} loss={loss_value:.4f}")
+    print(f"  greedy={greedy!r}")
+    print(f"  beam  ={beam!r}")
+
+
 if __name__ == "__main__":
     _self_check()
-    toy_logits = [
-        [1.2, 2.5, 0.2],  # mostly 'A'
-        [2.8, 0.7, 0.3],  # blank
-        [0.9, 0.4, 3.0],  # mostly 'B'
+    empty_target_logits = [
+        [3.5, 0.1, 0.2],
+        [3.0, 0.5, 0.1],
+        [2.8, 0.2, 0.2],
     ]
-    toy_target = [1, 2]
-    loss_value = ctc_loss(toy_logits, toy_target, blank=0)
-    alignment = _best_alignment_path(toy_logits, toy_target, blank=0)
-    printable_alignment = [
-        _index_to_symbol(idx, blank=0) or "<blank>" for idx in alignment
+    repeated_logits = [
+        [0.2, 2.5, 0.1],  # prefer 'A'
+        [0.1, 2.2, 0.3],  # prefer 'A'
+        [2.4, 0.2, 0.4],  # encourage blank separation
+        [0.2, 2.4, 0.3],  # second 'A'
     ]
-    print("Alignment path:", " ".join(printable_alignment))
-    print("Final loss:", f"{loss_value:.4f}")
-    print("Greedy decode:", greedy_decode(toy_logits, blank=0))
-    print(
-        "Beam search decode:",
-        beam_search(toy_logits, beam=5, blank=0, len_norm=True, ins_penalty=0.0),
-    )
+    repeated_target = [1, 1]  # "AA"
+    rng_logits = []
+    rng = Random(13)
+    for _ in range(128):
+        frame = [rng.uniform(-0.5, 0.5) for _ in range(5)]
+        frame[0] += 0.3  # keep blank competitive
+        rng_logits.append(frame)
+    rng_target = [1, 2, 3]  # "A", "B", "C"
+    _demo_case("empty-target", empty_target_logits, [])
+    _demo_case("double-letter", repeated_logits, repeated_target)
+    _demo_case("random-noise", rng_logits, rng_target)
