@@ -6,6 +6,7 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from textwrap import wrap
+from time import perf_counter
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import sys
@@ -499,6 +500,62 @@ def evaluate(
         blank_ratio=blank_ratio_sum / total if total else 0.0,
     )
     return metrics, showcase
+
+
+def profile_single_example(
+    stage: str,
+    data_dir: Path,
+    checkpoint: Path | None = None,
+    *,
+    sample_index: int = 0,
+) -> Dict[str, object]:
+    """Run a single-sample forward pass and collect timing/spike stats."""
+    stage = stage.upper()
+    if stage not in STAGE_CONFIGS:
+        raise ValueError(f"Unsupported stage: {stage}")
+    if sample_index < 0:
+        raise ValueError("sample_index must be non-negative")
+    limit = sample_index + 1
+    entries = load_dataset(stage, data_dir, limit=limit)
+    if not entries:
+        raise ValueError(f"Dataset at {data_dir} is empty")
+    idx = min(sample_index, len(entries) - 1)
+    entry = entries[idx]
+    model = load_checkpoint(checkpoint) if checkpoint else load_checkpoint(Path("__missing.ckpt__"))
+    image = entry["image"]  # type: ignore[index]
+    text = entry["text"]  # type: ignore[index]
+    sequence = image_to_sequence(image)
+    start = perf_counter()
+    logits = model.forward(sequence)
+    elapsed_ms = (perf_counter() - start) * 1000.0
+    prediction = predict_sequence(stage, logits)
+    blank_series, blank_ratio = _compute_blank_profile(logits)
+    spike_pack = spikes.encode_ttfs(image, T=ENERGY_TIMESTEPS, return_stats=True)
+    if isinstance(spike_pack, tuple):
+        spike_tensor, spike_summary = spike_pack
+    else:  # pragma: no cover - return_stats=True guarantees tuple
+        spike_tensor = spike_pack
+        histogram = spikes.spike_histogram(spike_tensor)
+        spike_summary = {"histogram": histogram, "total": sum(histogram)}
+    energy = energy_stats(spike_tensor)
+    return {
+        "stage": stage,
+        "file": str(entry["path"]),  # type: ignore[index]
+        "index": idx,
+        "text": text,
+        "prediction": prediction,
+        "match": prediction == text,
+        "sequence_length": len(sequence),
+        "inference_ms": elapsed_ms,
+        "blank_ratio": blank_ratio,
+        "blank_series": blank_series,
+        "fire_rate": compute_fire_rate(image),
+        "spike_total": float(spike_summary.get("total", 0.0)),
+        "spike_hist": spike_summary.get("histogram", []),
+        "energy_total": float(energy["total"]),
+        "energy_per_pixel": float(energy["per_pixel"]),
+        "duty_cycle": energy["duty_cycle"],
+    }
 
 
 def ensure_dataset(stage: str, data_dir: Path, size: int = 30) -> None:

@@ -72,6 +72,16 @@ class EvalMetricsTest(unittest.TestCase):
             self.assertAlmostEqual(payload["blank_ratio"], 0.75)
             self.assertEqual(payload["examples"], ["example_001.txt"])
 
+    def test_profile_single_example_returns_stats(self) -> None:
+        with TemporaryDirectory() as tmp:
+            stage = "S1"
+            data_dir = Path(tmp) / "profile"
+            eval_mod.ensure_dataset(stage, data_dir, size=2)
+            stats = eval_mod.profile_single_example(stage, data_dir)
+            self.assertEqual(stats["stage"], stage)
+            self.assertIn("inference_ms", stats)
+            self.assertIn("spike_hist", stats)
+
 
 if __name__ == "__main__":
     unittest.main()

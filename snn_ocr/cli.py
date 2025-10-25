@@ -3,12 +3,78 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict
 
 from snn_ocr import pgm, render, synth
-from snn_ocr.eval import evaluate, dump_examples, ensure_dataset
+from snn_ocr.eval import evaluate, dump_examples, ensure_dataset, profile_single_example
 from snn_ocr.train import TrainArgs, train_stage
 from snn_ocr.utils import Timer, ensure_dir
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def detect_git_state() -> Dict[str, Any]:
+    """Return the current git commit/dirty metadata when available."""
+    def _run(args: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                cwd=REPO_ROOT,
+                check=False,
+            )
+        except OSError:
+            return ""
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
+
+    commit = _run(["git", "rev-parse", "HEAD"])
+    describe = _run(["git", "describe", "--always", "--dirty"])
+    status = _run(["git", "status", "--porcelain"])
+    dirty = bool(status.strip()) if status else False
+    return {
+        "commit": commit,
+        "describe": describe,
+        "dirty": dirty,
+    }
+
+
+def build_repro_payload(
+    stage: str,
+    *,
+    seed: int,
+    data_dir: Path | None,
+    ckpt: Path | None,
+    command: str | None,
+    notes: str | None,
+    git_info: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    if git_info is None:
+        git_info = detect_git_state()
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    config = {
+        "stage": stage,
+        "seed": seed,
+        "data": str(data_dir) if data_dir else None,
+        "ckpt": str(ckpt) if ckpt else None,
+        "command": command or "",
+        "notes": notes or "",
+    }
+    return {
+        "stage": stage,
+        "generated_at": timestamp,
+        "python": sys.version,
+        "platform": sys.platform,
+        "cwd": str(Path.cwd()),
+        "git": git_info,
+        "config": config,
+    }
 
 
 def cmd_synth(ns: argparse.Namespace) -> None:
@@ -104,6 +170,55 @@ def cmd_eval(ns: argparse.Namespace) -> None:
     )
 
 
+def cmd_profile(ns: argparse.Namespace) -> None:
+    stage = ns.stage.upper()
+    sample_idx = max(0, int(ns.sample))
+    data_dir = Path(ns.data) if ns.data else Path("runs") / f"profile_{stage.lower()}"
+    ensure_dataset(stage, data_dir, size=sample_idx + 1)
+    checkpoint = Path(ns.ckpt) if ns.ckpt else None
+    stats = profile_single_example(stage, data_dir, checkpoint=checkpoint, sample_index=sample_idx)
+    print(json.dumps(stats, ensure_ascii=False))
+
+
+def cmd_doctor(ns: argparse.Namespace) -> None:
+    script = Path(ns.script)
+    if not script.exists():
+        raise FileNotFoundError(f"Self-check script not found: {script}")
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+    print(json.dumps({"script": str(script), "status": "ok"}, ensure_ascii=False))
+
+
+def cmd_repro(ns: argparse.Namespace) -> None:
+    stage = ns.stage.upper()
+    data_dir = Path(ns.data).resolve() if ns.data else None
+    ckpt = Path(ns.ckpt).resolve() if ns.ckpt else None
+    payload = build_repro_payload(
+        stage,
+        seed=ns.seed,
+        data_dir=data_dir,
+        ckpt=ckpt,
+        command=ns.command,
+        notes=ns.notes,
+    )
+    out_path = Path(ns.out)
+    ensure_dir(out_path.parent)
+    with out_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+    print(json.dumps({"stage": stage, "repro": str(out_path)}, ensure_ascii=False))
+
+
 def cmd_preview(ns: argparse.Namespace) -> None:
     text = ns.text.replace("\\n", "\n")
     width = ns.width
@@ -191,6 +306,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser_eval.add_argument("--examples", type=int, default=5)
     parser_eval.add_argument("--vis", type=str, default=str(Path("runs") / "vis"))
     parser_eval.set_defaults(func=cmd_eval)
+
+    parser_profile = subparsers.add_parser("profile", help="Profile single-batch inference stats.")
+    parser_profile.add_argument("--stage", type=str, default="S3")
+    parser_profile.add_argument("--data", type=str, default=None)
+    parser_profile.add_argument("--ckpt", type=str, default=None)
+    parser_profile.add_argument("--sample", type=int, default=0, help="Sample index inside the dataset.")
+    parser_profile.set_defaults(func=cmd_profile)
+
+    parser_doctor = subparsers.add_parser("doctor", help="Run self-check diagnostics.")
+    parser_doctor.add_argument(
+        "--script",
+        type=str,
+        default=str(Path("scripts") / "self_check.py"),
+        help="Path to scripts/self_check.py",
+    )
+    parser_doctor.set_defaults(func=cmd_doctor)
+
+    parser_repro = subparsers.add_parser("repro", help="Export reproducibility metadata.")
+    parser_repro.add_argument("--stage", type=str, default="S3")
+    parser_repro.add_argument("--seed", type=int, default=7)
+    parser_repro.add_argument("--data", type=str, default=None)
+    parser_repro.add_argument("--ckpt", type=str, default=None)
+    parser_repro.add_argument("--command", type=str, default="", help="Optional CLI command reference.")
+    parser_repro.add_argument("--notes", type=str, default="", help="Free-form notes for the repro file.")
+    parser_repro.add_argument("--out", type=str, default=str(Path("runs") / "repro" / "repro.json"))
+    parser_repro.set_defaults(func=cmd_repro)
 
     parser_preview = subparsers.add_parser("preview", help="Render text to a PGM and/or ASCII.")
     parser_preview.add_argument(
