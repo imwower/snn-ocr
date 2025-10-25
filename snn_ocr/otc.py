@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from random import Random
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 FeatureColumn = List[float]
 FeatureStep = List[FeatureColumn]
@@ -59,6 +59,8 @@ def _column_information(features: FeatureTensor, gate: str) -> List[float]:
 
 def _reduce_height(features: FeatureTensor, target_h: int) -> Tuple[SequenceTensor, int]:
     T, H, W, C = _validate_features(features)
+    if target_h <= 0:
+        raise ValueError("target_h must be positive")
     reduced: SequenceTensor = []
     for t in range(T):
         step: List[List[float]] = []
@@ -82,8 +84,12 @@ def compress_height(
     target_h: int = 1,
     gate: str = "var",
     max_merge: int = 4,
-) -> SequenceTensor:
-    """Compress features to (T, W', C) by collapsing height and merging low-information columns."""
+) -> Tuple[SequenceTensor, Tuple[int, int, int], List[Dict[str, float | int]]]:
+    """Compress features to (T, W', C) by collapsing height and merging columns.
+
+    Returns a tuple of (sequence, (T, W_prime, C), merge_log) where merge_log
+    contains records with start/end indices and the number of merged columns.
+    """
     if max_merge <= 0:
         raise ValueError("max_merge must be positive")
     reduced, original_width = _reduce_height(features, target_h=target_h)
@@ -91,6 +97,7 @@ def compress_height(
     mean_info = sum(info_values) / (len(info_values) or 1)
     groups: List[List[List[float]]] = []
     counts: List[int] = []
+    columns: List[List[int]] = []
     for w in range(original_width):
         column_vectors = [reduced[t][w][:] for t in range(len(reduced))]
         if (
@@ -105,16 +112,34 @@ def compress_height(
                 for c in range(len(previous[t])):
                     previous[t][c] = (previous[t][c] * prev_count + column_vectors[t][c]) / new_count
             counts[-1] = new_count
+            columns[-1].append(w)
         else:
             groups.append(column_vectors)
             counts.append(1)
+            columns.append([w])
     sequence: SequenceTensor = []
     for t in range(len(reduced)):
         step: List[List[float]] = []
         for group in groups:
             step.append(group[t][:])
         sequence.append(step)
-    return sequence
+    merge_log: List[Dict[str, float | int]] = []
+    for idx, col_group in enumerate(columns):
+        if not col_group:
+            continue
+        info_mean = sum(info_values[col] for col in col_group) / len(col_group)
+        merge_log.append(
+            {
+                "start": col_group[0],
+                "end": col_group[-1],
+                "count": len(col_group),
+                "info_mean": info_mean,
+            }
+        )
+    T, _, _, C = _validate_features(features)
+    W_prime = len(sequence[0]) if sequence else 0
+    shape = (T, W_prime, C)
+    return sequence, shape, merge_log
 
 
 def ascii_heatmap(values: Sequence[float]) -> str:
@@ -145,11 +170,13 @@ def _self_check() -> None:
                 row.append([rng.random(), rng.random()])
             time_slice.append(row)
         features.append(time_slice)
-    reduced = compress_height(features, target_h=1, gate="var", max_merge=2)
+    reduced, shape, log = compress_height(features, target_h=1, gate="var", max_merge=2)
     assert len(reduced) == 3
     assert len(reduced[0]) <= 5
     info = _column_information(features, gate="var")
     assert len(info) == 5
+    assert shape[1] == len(reduced[0])
+    assert len(log) == len(reduced[0])
 
 
 if __name__ == "__main__":
@@ -167,7 +194,14 @@ if __name__ == "__main__":
             time_slice.append(row)
         tensor.append(time_slice)
     info_values = _column_information(tensor, gate="var")
-    compressed = compress_height(tensor, target_h=1, gate="var", max_merge=2)
-    print(f"W -> W': {W} -> {len(compressed[0])}")
+    compressed, shape, log = compress_height(tensor, target_h=1, gate="var", max_merge=2)
+    compression_ratio = (shape[1] / W) if W else 0.0
+    print(f"W -> W': {W} -> {shape[1]} (ratio {compression_ratio:.2f})")
     print("Column information heatmap:")
     print(ascii_heatmap(info_values))
+    print("Merge log:")
+    for entry in log:
+        print(
+            f"  cols {entry['start']}..{entry['end']} (count={entry['count']}) "
+            f"info≈{entry['info_mean']:.4f}"
+        )

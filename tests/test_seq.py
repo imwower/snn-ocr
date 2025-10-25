@@ -21,17 +21,32 @@ class SequenceHeadTest(unittest.TestCase):
         self.assertEqual(len(smoothed[0]), len(self.sample[0]))
         self.assertEqual(len(smoothed[0][0]), len(self.sample[0][0]))
 
-    def test_pointwise_changes_channels(self) -> None:
-        mixed = seq.pointwise_spike(self.sample, out_channels=5)
-        self.assertEqual(len(mixed[0][0]), 5)
+    def test_pointwise_preserves_shape_and_range(self) -> None:
+        mixed = seq.pointwise_spike(self.sample)
+        self.assertEqual(len(mixed[0][0]), len(self.sample[0][0]))
+        for t_step in mixed:
+            for column in t_step:
+                for value in column:
+                    self.assertGreaterEqual(value, 0.0)
+                    self.assertLessEqual(value, 1.0)
 
     def test_linear_attention_respects_shape(self) -> None:
         smoothed = seq.dwconv1d_spike(self.sample, k=3)
-        mixed = seq.pointwise_spike(smoothed, out_channels=4)
-        attended = seq.linear_attention(mixed, heads=2)
+        mixed = seq.pointwise_spike(smoothed)
+        attended = seq.linear_attention(mixed, heads=2, key_dim=2)
         self.assertEqual(len(attended), len(self.sample))
         self.assertEqual(len(attended[0]), len(self.sample[0]))
-        self.assertEqual(len(attended[0][0]), 4)
+        self.assertEqual(len(attended[0][0]), len(self.sample[0][0]))
+
+    def test_spiking_head_handles_attention_toggle(self) -> None:
+        head_attn = seq.SpikingSeqHead(use_attention=True, heads=2)
+        head_no_attn = seq.SpikingSeqHead(use_attention=False)
+        out_attn = head_attn.forward(self.sample)
+        out_no_attn = head_no_attn.forward(self.sample)
+        self.assertEqual(len(out_attn), len(self.sample))
+        self.assertEqual(len(out_no_attn[0]), len(self.sample[0]))
+        self.assertEqual(len(out_attn[0][0]), len(self.sample[0][0]))
+        self.assertEqual(len(out_no_attn[0][0]), len(self.sample[0][0]))
 
 
 if __name__ == "__main__":

@@ -16,9 +16,11 @@ class OtcTest(unittest.TestCase):
                 [[float(w + 1)] for w in range(3)],
             ]
         ]
-        sequence = otc.compress_height(features, max_merge=1)
+        sequence, shape, log = otc.compress_height(features, max_merge=1)
         self.assertEqual(len(sequence), 1)
         self.assertEqual(len(sequence[0]), 3)
+        self.assertEqual(shape, (1, 3, 1))
+        self.assertEqual(len(log), 3)
         expected = [
             [(0.0 + 1.0) / 2],
             [(1.0 + 2.0) / 2],
@@ -40,10 +42,11 @@ class OtcTest(unittest.TestCase):
                 ]
                 time_slice.append(row)
             features.append(time_slice)
-        sequence = otc.compress_height(features, gate="var", max_merge=2)
-        self.assertLessEqual(len(sequence[0]), 3)
+        sequence, shape, log = otc.compress_height(features, gate="var", max_merge=2)
+        self.assertLessEqual(shape[1], 3)
         merged_tail = sequence[0][-1]
         self.assertTrue(all(abs(value - 0.05) < 1e-6 for value in merged_tail))
+        self.assertTrue(any(entry["count"] > 1 for entry in log))
 
     def test_entropy_gate(self) -> None:
         features = [
@@ -52,9 +55,10 @@ class OtcTest(unittest.TestCase):
                 [[0.3, 0.4], [0.4, 0.3]],
             ]
         ]
-        sequence = otc.compress_height(features, gate="entropy", max_merge=1)
+        sequence, shape, _ = otc.compress_height(features, gate="entropy", max_merge=1)
         self.assertEqual(len(sequence), 1)
         self.assertEqual(len(sequence[0]), 2)
+        self.assertEqual(shape, (1, 2, 2))
         heat = otc.ascii_heatmap([0.1, 0.5, 0.9])
         self.assertEqual(len(heat), 3)
 
