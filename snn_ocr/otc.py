@@ -52,8 +52,25 @@ def _column_information(features: FeatureTensor, gate: str) -> List[float]:
                 probs = [p / total for p in pos]
                 entropy = -sum(p * math.log(p + eps) for p in probs)
                 info_values.append(entropy)
+        elif gate == "laplace":
+            energy = 0.0
+            count = 0
+            for t in range(T):
+                for h in range(H):
+                    current = features[t][h][w]
+                    if w > 0:
+                        left = features[t][h][w - 1]
+                        for c in range(C):
+                            energy += abs(current[c] - left[c])
+                            count += 1
+                    if w + 1 < W:
+                        right = features[t][h][w + 1]
+                        for c in range(C):
+                            energy += abs(current[c] - right[c])
+                            count += 1
+            info_values.append(energy / (count or 1))
         else:
-            raise ValueError("gate must be 'var' or 'entropy'")
+            raise ValueError("gate must be 'var', 'entropy', or 'laplace'")
     return info_values
 
 
@@ -79,66 +96,170 @@ def _reduce_height(features: FeatureTensor, target_h: int) -> Tuple[SequenceTens
     return reduced, W
 
 
+def _segments_to_sequence(
+    reduced: SequenceTensor,
+    segments: List[Tuple[int, int]],
+) -> SequenceTensor:
+    if not reduced:
+        return []
+    sequence: SequenceTensor = []
+    C = len(reduced[0][0]) if reduced[0] else 0
+    for t in range(len(reduced)):
+        step: List[List[float]] = []
+        for start, end in segments:
+            count = max(1, end - start + 1)
+            accum = [0.0 for _ in range(C)]
+            for w in range(start, end + 1):
+                column = reduced[t][w]
+                for c in range(C):
+                    accum[c] += column[c]
+            step.append([value / count for value in accum])
+        sequence.append(step)
+    return sequence
+
+
+def _build_merge_log(
+    info_values: Sequence[float],
+    segments: List[Tuple[int, int]],
+    column_map: List[int],
+    curve: List[Dict[str, float]] | None,
+) -> List[Dict[str, float | int | List[int] | List[Dict[str, float]]]]:
+    merge_log: List[Dict[str, float | int | List[int] | List[Dict[str, float]]]] = []
+    for seg_idx, (start, end) in enumerate(segments):
+        cols = list(range(start, end + 1))
+        info_slice = info_values[start : end + 1]
+        info_mean = sum(info_slice) / (len(info_slice) or 1)
+        merge_log.append(
+            {
+                "segment": seg_idx,
+                "start": start,
+                "end": end,
+                "count": len(cols),
+                "info_mean": info_mean,
+                "columns": cols,
+            }
+        )
+    if merge_log:
+        merge_log[0]["column_map"] = column_map
+        if curve:
+            merge_log[0]["curve"] = curve
+    return merge_log
+
+
+def _segments_to_column_map(
+    segments: Sequence[Tuple[int, int]],
+    width: int,
+) -> List[int]:
+    column_map = [0 for _ in range(width)]
+    for seg_idx, (start, end) in enumerate(segments):
+        for w in range(start, end + 1):
+            column_map[w] = seg_idx
+    return column_map
+
+
+def _greedy_segments(
+    info_values: Sequence[float],
+    max_merge: int,
+) -> List[Tuple[int, int]]:
+    if max_merge <= 0:
+        raise ValueError("max_merge must be positive")
+    segments: List[Tuple[int, int]] = []
+    window = max(1, max_merge * 2)
+    for w in range(len(info_values)):
+        start = max(0, w - window + 1)
+        local_slice = info_values[start : w + 1]
+        local_mean = sum(local_slice) / len(local_slice)
+        if segments:
+            seg_start, seg_end = segments[-1]
+            seg_len = seg_end - seg_start + 1
+            if info_values[w] <= local_mean and seg_len < max_merge:
+                segments[-1] = (seg_start, w)
+                continue
+        segments.append((w, w))
+    return segments
+
+
+def _dp_optimal_segments(
+    info_values: Sequence[float],
+    target_width: int,
+) -> Tuple[List[Tuple[int, int]], List[Dict[str, float]]]:
+    W = len(info_values)
+    if target_width <= 0 or target_width > W:
+        raise ValueError("target_width must be in [1, W]")
+    prefix = [0.0]
+    for value in info_values:
+        prefix.append(prefix[-1] + value)
+    dp = [[math.inf for _ in range(W + 1)] for _ in range(target_width + 1)]
+    choice = [[-1 for _ in range(W + 1)] for _ in range(target_width + 1)]
+    dp[0][0] = 0.0
+    curve: List[Dict[str, float]] = []
+    for k in range(1, target_width + 1):
+        best_val = math.inf
+        best_idx = -1
+        min_w = k
+        max_w = W - (target_width - k)
+        for w in range(min_w, max_w + 1):
+            prev_idx = w - 1
+            prev_cost = dp[k - 1][prev_idx]
+            if prev_cost < math.inf:
+                candidate = prev_cost - prefix[prev_idx]
+                if candidate < best_val:
+                    best_val = candidate
+                    best_idx = prev_idx
+            if best_idx == -1:
+                continue
+            dp[k][w] = prefix[w] + best_val
+            choice[k][w] = best_idx
+        total_cost = dp[k][W]
+        if not math.isinf(total_cost):
+            curve.append(
+                {
+                    "segments": float(k),
+                    "ratio": float(k) / float(W or 1),
+                    "cost": total_cost,
+                }
+            )
+    if math.isinf(dp[target_width][W]):
+        raise RuntimeError("Unable to construct optimal segments with the given budget")
+    segments: List[Tuple[int, int]] = []
+    w = W
+    for k in range(target_width, 0, -1):
+        prev = choice[k][w]
+        if prev < 0:
+            raise RuntimeError("Invalid DP backtrack state")
+        segments.append((prev, w - 1))
+        w = prev
+    segments.reverse()
+    return segments, curve
+
+
 def compress_height(
     features: FeatureTensor,
     target_h: int = 1,
     gate: str = "var",
+    target_width: int | None = None,
     max_merge: int = 4,
-) -> Tuple[SequenceTensor, Tuple[int, int, int], List[Dict[str, float | int]]]:
-    """Compress features to (T, W', C) by collapsing height and merging columns.
-
-    Returns a tuple of (sequence, (T, W_prime, C), merge_log) where merge_log
-    contains records with start/end indices and the number of merged columns.
-    """
-    if max_merge <= 0:
-        raise ValueError("max_merge must be positive")
+    strategy: str = "auto",
+) -> Tuple[SequenceTensor, Tuple[int, int, int], List[Dict[str, float | int | List[int]]]]:
+    """Compress features to (T, W', C) by collapsing height and merging columns."""
+    if strategy not in ("auto", "dp", "threshold"):
+        raise ValueError("strategy must be 'auto', 'dp', or 'threshold'")
     reduced, original_width = _reduce_height(features, target_h=target_h)
     info_values = _column_information(features, gate=gate)
-    groups: List[List[List[float]]] = []
-    counts: List[int] = []
-    columns: List[List[int]] = []
-    window = max(1, max_merge * 2)
-    for w in range(original_width):
-        column_vectors = [reduced[t][w][:] for t in range(len(reduced))]
-        start = max(0, w - window + 1)
-        local_slice = info_values[start : w + 1]
-        local_mean = sum(local_slice) / len(local_slice)
-        if (
-            groups
-            and info_values[w] <= local_mean
-            and counts[-1] < max_merge
-        ):
-            prev_count = counts[-1]
-            previous = groups[-1]
-            new_count = prev_count + 1
-            for t in range(len(previous)):
-                for c in range(len(previous[t])):
-                    previous[t][c] = (previous[t][c] * prev_count + column_vectors[t][c]) / new_count
-            counts[-1] = new_count
-            columns[-1].append(w)
-        else:
-            groups.append(column_vectors)
-            counts.append(1)
-            columns.append([w])
-    sequence: SequenceTensor = []
-    for t in range(len(reduced)):
-        step: List[List[float]] = []
-        for group in groups:
-            step.append(group[t][:])
-        sequence.append(step)
-    merge_log: List[Dict[str, float | int]] = []
-    for idx, col_group in enumerate(columns):
-        if not col_group:
-            continue
-        info_mean = sum(info_values[col] for col in col_group) / len(col_group)
-        merge_log.append(
-            {
-                "start": col_group[0],
-                "end": col_group[-1],
-                "count": len(col_group),
-                "info_mean": info_mean,
-            }
-        )
+    use_dp = target_width is not None and strategy in ("auto", "dp")
+    segments: List[Tuple[int, int]]
+    curve: List[Dict[str, float]] | None = None
+    if use_dp:
+        segments, curve = _dp_optimal_segments(info_values, int(target_width))
+        if len(segments) != int(target_width):
+            raise RuntimeError("DP segmentation produced inconsistent width")
+    else:
+        if max_merge <= 0:
+            raise ValueError("max_merge must be positive")
+        segments = _greedy_segments(info_values, max_merge=max_merge)
+    sequence = _segments_to_sequence(reduced, segments)
+    column_map = _segments_to_column_map(segments, original_width)
+    merge_log = _build_merge_log(info_values, segments, column_map, curve)
     T, _, _, C = _validate_features(features)
     W_prime = len(sequence[0]) if sequence else 0
     shape = (T, W_prime, C)
@@ -197,14 +318,43 @@ if __name__ == "__main__":
             time_slice.append(row)
         tensor.append(time_slice)
     info_values = _column_information(tensor, gate="var")
-    compressed, shape, log = compress_height(tensor, target_h=1, gate="var", max_merge=2)
-    compression_ratio = (shape[1] / W) if W else 0.0
-    print(f"W -> W': {W} -> {shape[1]} (ratio {compression_ratio:.2f})")
+    ascii_map = ascii_heatmap(info_values)
+    target = max(1, W // 2)
+    seq_dp, shape_dp, log_dp = compress_height(
+        tensor,
+        target_h=1,
+        gate="var",
+        target_width=target,
+        strategy="dp",
+    )
+    seq_greedy, shape_greedy, log_greedy = compress_height(
+        tensor,
+        target_h=1,
+        gate="var",
+        max_merge=2,
+        strategy="threshold",
+    )
     print("Column information heatmap:")
-    print(ascii_heatmap(info_values))
-    print("Merge log:")
-    for entry in log:
+    print(ascii_map)
+    print(f"DP target W'={target}: {W}->{shape_dp[1]} tokens")
+    if log_dp:
+        curve = log_dp[0].get("curve", [])
+        if curve:
+            print("Compression curve (segments, ratio, cost):")
+            for node in curve:
+                print(
+                    f"  k={int(node['segments'])} ratio={node['ratio']:.2f} "
+                    f"cost={node['cost']:.4f}"
+                )
+    print("DP merge log:")
+    for entry in log_dp:
         print(
-            f"  cols {entry['start']}..{entry['end']} (count={entry['count']}) "
-            f"info≈{entry['info_mean']:.4f}"
+            f"  seg {entry['segment']} cols {entry['start']}..{entry['end']} "
+            f"count={entry['count']} info≈{entry['info_mean']:.4f}"
+        )
+    print(f"Greedy baseline: {W}->{shape_greedy[1]} tokens")
+    for entry in log_greedy:
+        print(
+            f"  seg {entry['segment']} cols {entry['start']}..{entry['end']} "
+            f"count={entry['count']} info≈{entry['info_mean']:.4f}"
         )
