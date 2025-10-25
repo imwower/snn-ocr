@@ -16,7 +16,10 @@
 9. [CLI 使用方法](#8-使用方法cli)  
 10. [指标与能耗](#9-指标与能耗估算)  
 11. [限制与扩展](#10-已知限制与扩展)  
-12. [许可证](#11-许可证)
+12. [训练配方参考](#11-训练配方参考)  
+13. [常见数值问题 FAQ](#12-常见数值问题-faq)  
+14. [标准库 Only 性能建议](#13-标准库-only-性能建议)  
+15. [许可证](#14-许可证)
 
 ---
 
@@ -197,6 +200,71 @@ python -m snn_ocr.cli preview --text "HELLO\\nWORLD!" --out /tmp/hello.pgm --asc
 - 位图字体较简单，复杂连笔/花体需自行扩展 `bitfont.py`。
 - 训练默认在小数据集上演示；大规模实验需自行调参并谨慎评估。
 
-## 11. 许可证
+## 11. 训练配方参考
+
+以下三档配方均以内置合成数据、标准库 CLI 为前提，命令遵循 `python -m snn_ocr.cli ...` 约定。
+
+### 11.1 入门速训（≈30 分钟，S1→S2）
+- 目标：S1 Top-1 ≥ 0.985，S2 Top-1 ≥ 0.94。
+- 命令示例：
+  ```bash
+  python -m snn_ocr.cli synth --stage S1 --n 1500 --out data/s1_digits
+  python -m snn_ocr.cli synth --stage S2 --n 2000 --out data/s2_letters
+  python -m snn_ocr.cli train --stage S1 --data data/s1_digits --epochs 6 --batch 8 --lr 0.004
+  python -m snn_ocr.cli train --stage S2 --data data/s2_letters --epochs 8 --batch 8 --lr 0.003 --replay 0.1
+  ```
+- 调参：若 Top-1 未达标，增大 `--epochs`（+2）或降低 `--lr` 0.0005。
+
+### 11.2 中阶单词（≈2 小时，S1→S3）
+- 目标：S3 CER ≤ 0.18，WER ≤ 0.28，平均脉冲总量≤3.8e3。
+- 命令示例：
+  ```bash
+  python -m snn_ocr.cli synth --stage S3 --n 9000 --out data/s3_words
+  python -m snn_ocr.cli train --stage S2 --data data/s2_letters --epochs 10 --batch 12 --lr 0.003 --replay 0.15
+  python -m snn_ocr.cli train --stage S3 --data data/s3_words --epochs 12 --batch 6 --lr 0.002 --beam 5 --clip 0.7
+  ```
+- 预期指标：`train` 日志中 `cer≈0.17±0.02`，OTC 输出 `W→W' ≈ 48→16`。
+- 监控：如脉冲超过阈值，将 `spikes.encode_poisson` 的 `rate_scale` 调低至 0.9（在 `snn_ocr/spikes.py` 中）。
+
+### 11.3 句子全链（≈4 小时，S1→S4）
+- 目标：S4 CER ≤ 0.25，WER ≤ 0.42；平均 blank 占比 0.55±0.05。
+- 命令示例：
+  ```bash
+  python -m snn_ocr.cli synth --stage S4 --n 15000 --out data/s4_sentences --seed 11
+  python -m snn_ocr.cli train --stage S3 --data data/s3_words --epochs 14 --batch 6 --lr 0.0018 --beam 6
+  python -m snn_ocr.cli train --stage S4 --data data/s4_sentences --epochs 18 --batch 4 --lr 0.0015 \
+      --beam 8 --cosine --clip 0.6 --distill --teacher runs/s3/ckpt.json
+  python -m snn_ocr.cli eval --stage S4 --data data/s4_sentences --ckpt runs/s4/ckpt.json --examples 8
+  ```
+- 评估：`runs/vis/s4/report.json` 应显示 `top1≈0.62`、`blank_ratio≈0.56`、`duty` 呈平缓下降。
+- 若 CER 卡在 0.3，可尝试：`--distill-lambda 0.4`、增大 `--warmup-steps 300`、调低 OTC `target_width` 至输入宽度的 1/4。
+
+## 12. 常见数值问题 FAQ
+
+| 症状 | 可能原因 | 快速排查 | 解决方案 |
+| --- | --- | --- | --- |
+| CTC 解码全 `<blank>`（空白塌缩） | OTT 压得过窄 / Beam 太小 / Blank logits 偏高 | `python -m snn_ocr.cli eval --stage S4 ...` 查看 `blank_ratio` 是否 >0.7 | 1) 调高 OTC `max_merge`; 2) 训练期拉大 `--beam`; 3) 在 `train.py` 的 logits 上加 `-0.1` 的 blank 偏置。 |
+| 发放过多（脉冲爆，能耗飙升） | `rate_scale` 偏大或输入对比度过高 | 查看 `compute_fire_rate`（训练日志）是否 >0.35 | 1) 在 `spikes.encode_poisson` 调低 `rate_scale`; 2) 合成数据降低 `--contrast`; 3) OTC 前加入列归一。 |
+| 发放过少（序列稀疏，梯度停滞） | TTFS 阈值过高 / 输入过暗 | `python -m snn_ocr.cli profile --stage S3 ...` 检查 `spike_total` | 1) 增大合成噪声、加随机亮度；2) 将 LIF `v_th` 从 1.0 调至 0.85；3) 使用 Poisson 编码替换 TTFS。 |
+| 梯度爆炸 | 学习率过大 / clip 失效 | 日志出现 `nan loss`、`grad_inf` | 1) 减小 `--lr` 和 `--clip`; 2) 检查是否对空 batch 回传；3) 在 `train.py` 中启用 `clip_mode=value`。 |
+| 梯度消失 | TET 权重全部落在前时步 / 输入序列过长 | Loss 始终 >1 且无下降 | 1) 切换 `tet_mode` 为 `tail`; 2) 缩短 OTC 输出宽度；3) 添加知识蒸馏（`--distill`）。 |
+
+更多诊断：
+1. `python -m snn_ocr.cli doctor` → 自检 Import 与 smoke 测试。
+2. `python -m snn_ocr.cli profile --stage S4 --sample 3` → 单样本推理耗时、blank 时间线。
+3. `python -m snn_ocr.cli repro --stage S3 --ckpt runs/s3/ckpt.json --out runs/repro/s3.json` → 固化调参状态。
+
+## 13. 标准库 Only 性能建议
+
+1. **预分配列表**：在卷积、OTC 等核心循环中使用 `[0.0 for _ in range(n)]` 一次性创建，再用索引覆写，避免频繁 `append`。
+2. **memoryview/bytearray**：PGM/PPM IO 或 spike tensor 转换时用 `memoryview(bytearray(...))` 原位操作，减少复制。
+3. **行缓冲卷积**：在 `lif._linear_conv2d` 等函数内缓存上一行的 padded 结果，可将重复访问降至 O(1)。
+4. **减少对象创建**：训练循环里复用 `dict` / `list` 模板 (`template = [0.0]*C`)，避免在每次前向重新构造。
+5. **批量随机数**：`random.Random` 上使用 `randint/gauss` 优先批量生成列表，再迭代使用；伪随机抖动使用 `itertools.cycle` 重用序列。
+6. **解析器/日志**：CLI 输出采用行缓冲 `print(json.dumps(...))`，不要频繁 flush；训练日志写入 `metrics.jsonl`，减少 stdout 压力。
+
+## 14. 许可证
+
+MIT License，详见仓库根目录的 `LICENSE` 文件。
 - 代码与 5×7 / 7×9 位图字体均遵循 **MIT License**。
 - 合成数据仅供研究、测试与教学使用。
