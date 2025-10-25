@@ -110,7 +110,11 @@ class StageSampler:
     def next_sample(self) -> Tuple[List[List[int]], str]:
         self.counter += 1
         seed = self.counter
-        gray, text = synth.make_sample(self.stage, seed=seed)
+        sample = synth.make_sample(self.stage, seed=seed)
+        if isinstance(sample, tuple) and len(sample) == 3:
+            gray, text, _meta = sample
+        else:
+            gray, text = sample  # type: ignore[misc]
         return gray, text
 
     def state_dict(self) -> Dict[str, int]:
