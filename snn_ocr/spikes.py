@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import math
 from random import Random
-from typing import List, Sequence, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 GrayGrid = List[List[int]]
 SpikeTensor = List[List[List[int]]]
@@ -39,7 +39,50 @@ def _validate_spike_tensor(spikes: SpikeTensor) -> Tuple[int, int, int]:
     return T, height, width
 
 
-def encode_ttfs(gray: GrayGrid, T: int) -> SpikeTensor:
+def spike_histogram(spikes: SpikeTensor) -> List[int]:
+    """Return per-timestep spike counts."""
+    return [sum(sum(row) for row in frame) for frame in spikes]
+
+
+def assert_ttfs_single_spike(spikes: SpikeTensor) -> None:
+    """Ensure TTFS tensors fire at most once per pixel (across time)."""
+    T, height, width = _validate_spike_tensor(spikes)
+    seen = [[0 for _ in range(width)] for _ in range(height)]
+    for t in range(T):
+        frame = spikes[t]
+        for y in range(height):
+            for x in range(width):
+                if frame[y][x]:
+                    if seen[y][x]:
+                        raise AssertionError(f"TTFS pixel ({x},{y}) fired more than once")
+                    seen[y][x] = 1
+
+
+def _random_offsets(
+    T: int,
+    jitter: int,
+    seed: int | None,
+    width: int,
+    height: int,
+) -> Tuple[List[int], List[int]]:
+    if jitter <= 0:
+        return [0] * T, [0] * T
+    limit_x = min(jitter, max(0, width - 1))
+    limit_y = min(jitter, max(0, height - 1))
+    rng = Random(seed)
+    dx = [rng.randint(-limit_x, limit_x) for _ in range(T)] if limit_x else [0] * T
+    dy = [rng.randint(-limit_y, limit_y) for _ in range(T)] if limit_y else [0] * T
+    return dx, dy
+
+
+def encode_ttfs(
+    gray: GrayGrid,
+    T: int,
+    *,
+    jitter: int = 0,
+    seed: int | None = None,
+    return_stats: bool = False,
+) -> SpikeTensor | Tuple[SpikeTensor, Dict[str, object]]:
     """Encode grayscale intensities via Time-To-First-Spike (TTFS)."""
     if T <= 0:
         raise ValueError("Number of steps T must be positive")
@@ -53,6 +96,18 @@ def encode_ttfs(gray: GrayGrid, T: int) -> SpikeTensor:
             step = int(round((1.0 - intensity) * (T - 1)))
             step = max(0, min(T - 1, step))
             spikes[step][y][x] = 1
+    assert_ttfs_single_spike(spikes)
+    if jitter > 0:
+        dx, dy = _random_offsets(T, jitter, seed, width, height)
+        spikes = apply_micro_saccade(spikes, dx=dx, dy=dy)
+    if return_stats:
+        hist = spike_histogram(spikes)
+        summary = {
+            "histogram": hist,
+            "total": sum(hist),
+            "jitter": jitter,
+        }
+        return spikes, summary
     return spikes
 
 
@@ -61,7 +116,10 @@ def encode_poisson(
     T: int,
     rate_scale: float = 1.0,
     seed: int = 0,
-) -> SpikeTensor:
+    *,
+    jitter: int = 0,
+    return_stats: bool = False,
+) -> SpikeTensor | Tuple[SpikeTensor, Dict[str, object]]:
     """Rate-code grayscale values into binary spikes using a Poisson process."""
     if T <= 0:
         raise ValueError("Number of steps T must be positive")
@@ -78,6 +136,12 @@ def encode_poisson(
                 prob = max(0.0, min(1.0, prob))
                 if rng.random() < prob:
                     spikes[t][y][x] = 1
+    if jitter > 0:
+        spikes = apply_random_micro_saccade(spikes, jitter=jitter, seed=seed)
+    if return_stats:
+        hist = spike_histogram(spikes)
+        summary = {"histogram": hist, "total": sum(hist), "jitter": jitter}
+        return spikes, summary
     return spikes
 
 
@@ -136,6 +200,46 @@ def apply_micro_saccade(
     return shifted
 
 
+def apply_random_micro_saccade(
+    spikes: SpikeTensor,
+    jitter: int = 1,
+    seed: int | None = None,
+) -> SpikeTensor:
+    """Convenience wrapper that samples offsets in [-jitter, jitter]."""
+    if jitter <= 0:
+        return spikes
+    T, height, width = _validate_spike_tensor(spikes)
+    dx, dy = _random_offsets(T, jitter, seed, width, height)
+    return apply_micro_saccade(spikes, dx=dx, dy=dy)
+
+
+def alpha_schedule(layers: int, base_tau: float = 4.0, decay: float = 0.85) -> List[float]:
+    """Return per-layer alpha = exp(-1/tau) schedule for multi-tau processing."""
+    if layers <= 0:
+        raise ValueError("layers must be positive")
+    if base_tau <= 0.0:
+        raise ValueError("base_tau must be positive")
+    if not (0.0 < decay <= 1.0):
+        raise ValueError("decay must be in (0, 1]")
+    alphas: List[float] = []
+    current_tau = base_tau
+    for _ in range(layers):
+        alpha = math.exp(-1.0 / current_tau)
+        alphas.append(alpha)
+        current_tau *= decay
+    return alphas
+
+
+def spike_summary(spikes: SpikeTensor) -> Dict[str, object]:
+    hist = spike_histogram(spikes)
+    total = sum(hist)
+    return {
+        "histogram": hist,
+        "total": total,
+        "mean_per_step": total / max(1, len(hist)),
+    }
+
+
 def _self_check() -> None:
     dummy = [[0, 128, 255]]
     ttfs = encode_ttfs(dummy, T=4)
@@ -149,18 +253,34 @@ def _self_check() -> None:
 
 
 if __name__ == "__main__":
+    import argparse
+
     _self_check()
-    sample = [[int(255 * (x % 2)) for x in range(8)] for _ in range(8)]
-    ttfs_spikes = encode_ttfs(sample, T=4)
-    poisson_spikes = encode_poisson(sample, T=4, seed=42)
-    micro_spikes = apply_micro_saccade(poisson_spikes, dx=[0, 1, 0, -1], dy=[0, 0, 1, 0])
-    on_channel, off_channel = split_on_off(ttfs_spikes)
-    for name, tensor in [
-        ("TTFS", ttfs_spikes),
-        ("Poisson", poisson_spikes),
-        ("Micro-saccade", micro_spikes),
-        ("ON", on_channel),
-        ("OFF", off_channel),
-    ]:
-        counts = [sum(sum(row) for row in frame) for frame in tensor]
-        print(f"{name} spike counts per step: {counts}")
+
+    parser = argparse.ArgumentParser(description="Spike encoder diagnostics.")
+    parser.add_argument("--mode", choices=["ttfs", "poisson"], default="ttfs")
+    parser.add_argument("--timesteps", type=int, default=8)
+    parser.add_argument("--rate-scale", type=float, default=1.0)
+    parser.add_argument("--jitter", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--show-tau", type=int, default=0, help="Print alpha schedule for N layers when >0.")
+    args = parser.parse_args()
+
+    width = 8
+    sample = [[int(255 * (x / (width - 1))) for x in range(width)]]
+    if args.mode == "ttfs":
+        result = encode_ttfs(sample, args.timesteps, jitter=args.jitter, seed=args.seed, return_stats=True)
+    else:
+        result = encode_poisson(
+            sample,
+            args.timesteps,
+            rate_scale=args.rate_scale,
+            seed=args.seed,
+            jitter=args.jitter,
+            return_stats=True,
+        )
+    spikes_tensor, stats = result  # type: ignore[assignment]
+    print(f"[{args.mode.upper()}] histogram per step: {stats['histogram']}")
+    print(f"Total spikes: {stats['total']}")
+    if args.show_tau > 0:
+        print("Alpha schedule:", alpha_schedule(args.show_tau))
