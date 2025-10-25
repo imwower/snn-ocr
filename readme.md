@@ -181,12 +181,24 @@ python -m snn_ocr.cli train --stage S2 --data data/s2_letters --replay data/s1_d
 # S3 / S4 CTC
 python -m snn_ocr.cli train --stage S3 --data data/s3_words --epochs 10 --beam 5
 python -m snn_ocr.cli train --stage S4 --data data/s4_sentences --epochs 12 --beam 8
+
+# 推荐：S3 单词 CTC 训练（目标 CER≤0.18）
+python -m snn_ocr.cli train   --stage S3   --data data/s3_words   --epochs 12   --batch 6   --lr 0.002   --beam 5   --clip 0.7
 ```
 
 ### 评估与可视化
 ```bash
 python -m snn_ocr.cli eval --stage S4 --data data/s4_sentences --ckpt runs/s4/ckpt.json
 python -m snn_ocr.cli preview --text "HELLO\\nWORLD!" --out /tmp/hello.pgm --ascii
+
+
+# 推荐：配套 S3 评估（输出 CER/WER + runs/vis 报告）
+python -m snn_ocr.cli eval \
+  --stage S3 \
+  --data data/s3_words \
+  --ckpt runs/s3/ckpt.json \
+  --examples 6 \
+  --vis runs/vis
 ```
 
 ## 9. 指标与能耗（估算）
