@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from textwrap import wrap
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import sys
@@ -12,8 +13,8 @@ import sys
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from snn_ocr import pgm, render, synth, spikes
-from snn_ocr.ctc import greedy_decode, symbol_table
+from snn_ocr import otc, pgm, render, synth, spikes
+from snn_ocr.ctc import best_alignment_path, greedy_decode, symbol_table
 from snn_ocr.train import (
     BLANK_INDEX,
     CHAR_TO_INDEX,
@@ -27,6 +28,115 @@ from snn_ocr.train import (
 
 SYMBOLS: Tuple[str, ...] = symbol_table()
 ENERGY_TIMESTEPS = 6
+OTC_GATE = "var"
+OTC_TOPK = 5
+
+
+def _pretty_symbol(index: int) -> str:
+    if index == BLANK_INDEX:
+        return "<blank>"
+    if 0 <= index < len(SYMBOLS):
+        symbol = SYMBOLS[index]
+        if symbol == " ":
+            return "<space>"
+        if symbol == "\n":
+            return "<lf>"
+        return symbol
+    return str(index)
+
+
+def _collapse_path(indices: Sequence[int]) -> str:
+    collapsed: List[str] = []
+    prev: int | None = None
+    for index in indices:
+        if index == BLANK_INDEX:
+            prev = None
+            continue
+        if prev == index:
+            continue
+        symbol = SYMBOLS[index] if 0 <= index < len(SYMBOLS) else str(index)
+        collapsed.append(symbol)
+        prev = index
+    return "".join(collapsed)
+
+
+def _alignment_with_marks(ref: str, hyp: str) -> Tuple[str, str, str]:
+    aligned_ref, aligned_hyp = align_strings(ref, hyp)
+    marks: List[str] = []
+    for ref_ch, hyp_ch in zip(aligned_ref, aligned_hyp):
+        if ref_ch == hyp_ch and ref_ch != "-":
+            marks.append("|")
+        else:
+            marks.append("^")
+    return aligned_ref, aligned_hyp, "".join(marks)
+
+
+def _compute_blank_profile(logits: Sequence[Sequence[float]]) -> Tuple[List[float], float]:
+    if not logits:
+        return [], 0.0
+    series: List[float] = []
+    for step in logits:
+        probs = softmax(step)
+        series.append(probs[BLANK_INDEX] if len(probs) > BLANK_INDEX else 0.0)
+    mean = sum(series) / len(series)
+    return series, mean
+
+
+def _compute_ctc_path(stage: str, logits: Sequence[Sequence[float]], target: str) -> Tuple[List[str], str]:
+    if stage in ("S1", "S2"):
+        return [], ""
+    if not logits:
+        return [], ""
+    try:
+        target_indices = text_to_indices(target)
+    except ValueError:
+        return [], ""
+    if not target_indices:
+        return [], ""
+    path = best_alignment_path(logits, target_indices, blank=BLANK_INDEX)
+    tokens = [_pretty_symbol(index) for index in path]
+    collapsed = _collapse_path(path)
+    return tokens, collapsed
+
+
+def _gray_to_feature_tensor(image: List[List[int]]) -> List[List[List[List[float]]]]:
+    if not image or not image[0]:
+        return []
+    height = len(image)
+    width = len(image[0])
+    time_slice: List[List[List[float]]] = []
+    for y in range(height):
+        row: List[List[float]] = []
+        for x in range(width):
+            row.append([image[y][x] / 255.0])
+        time_slice.append(row)
+    return [time_slice]
+
+
+def _compute_otc_summary(image: List[List[int]]) -> Tuple[str, List[Tuple[int, float]], List[float]]:
+    features = _gray_to_feature_tensor(image)
+    if not features:
+        return "", [], []
+    info_values = otc.column_information(features, gate=OTC_GATE)
+    heatmap = otc.ascii_heatmap(info_values)
+    ranked = sorted(enumerate(info_values), key=lambda item: item[1], reverse=True)
+    topk = ranked[:OTC_TOPK]
+    return heatmap, topk, info_values
+
+
+def _format_timeline(tokens: Sequence[str], chunk: int = 10) -> str:
+    if not tokens:
+        return "<empty>"
+    parts: List[str] = []
+    current: List[str] = []
+    for idx, token in enumerate(tokens):
+        current.append(f"{idx:02d}:{token}")
+        if len(current) >= chunk:
+            parts.append(" | ".join(current))
+            current = []
+    if current:
+        parts.append(" | ".join(current))
+    return "\n".join(parts)
 
 
 def edit_distance(seq_a: Sequence[str], seq_b: Sequence[str]) -> int:
@@ -144,13 +254,17 @@ class ExampleRecord:
     ascii_art: str
     alignment_ref: str
     alignment_hyp: str
+    alignment_marks: str = ""
     energy_total: int = 0
     energy_per_pixel: float = 0.0
-    duty_cycle: List[float] = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.duty_cycle is None:
-            self.duty_cycle = []
+    duty_cycle: List[float] = field(default_factory=list)
+    blank_ratio: float = 0.0
+    blank_series: List[float] = field(default_factory=list)
+    ctc_path: List[str] = field(default_factory=list)
+    ctc_collapsed: str = ""
+    otc_heatmap: str = ""
+    otc_values: List[float] = field(default_factory=list)
+    otc_top_columns: List[Tuple[int, float]] = field(default_factory=list)
 
 
 @dataclass
@@ -164,10 +278,16 @@ class EvalMetrics:
     energy_total: float
     energy_per_pixel: float
     duty_cycle: List[float]
+    blank_ratio: float
 
 
-def dump_examples(examples: Sequence[ExampleRecord], out_dir: Path) -> None:
+def dump_examples(
+    examples: Sequence[ExampleRecord],
+    out_dir: Path,
+    metrics: EvalMetrics | None = None,
+) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    manifest: List[str] = []
     for idx, record in enumerate(examples, start=1):
         target_file = out_dir / f"example_{idx:03d}.txt"
         with target_file.open("w", encoding="utf-8") as handle:
@@ -175,9 +295,30 @@ def dump_examples(examples: Sequence[ExampleRecord], out_dir: Path) -> None:
             handle.write(f"Reference: {record.text}\n")
             handle.write(f"Hypothesis: {record.prediction}\n")
             handle.write(f"CER: {record.cer_value:.3f}, WER: {record.wer_value:.3f}\n")
-            handle.write("Alignment (ref/hyp):\n")
+            handle.write("Alignment (ref/hyp/marks):\n")
             handle.write(record.alignment_ref + "\n")
             handle.write(record.alignment_hyp + "\n")
+            handle.write(record.alignment_marks + "\n")
+            handle.write(f"Blank duty: {record.blank_ratio:.3f}\n")
+            if record.blank_series:
+                blank_heat = otc.ascii_heatmap(record.blank_series)
+                preview = ", ".join(f"{value:.2f}" for value in record.blank_series[:12])
+                handle.write(f"Blank timeline: {blank_heat}\n")
+                handle.write(f"Blank probs[:12]: {preview}\n")
+            if record.ctc_path:
+                collapsed = record.ctc_collapsed or "<empty>"
+                handle.write(f"CTC collapsed: {collapsed}\n")
+                handle.write("CTC path timeline:\n")
+                handle.write(_format_timeline(record.ctc_path) + "\n")
+            if record.otc_heatmap:
+                handle.write("OTC information heatmap:\n")
+                for line in wrap(record.otc_heatmap, width=64):
+                    handle.write(line + "\n")
+                if record.otc_top_columns:
+                    tops = ", ".join(
+                        f"c{col}={value:.3f}" for col, value in record.otc_top_columns
+                    )
+                    handle.write(f"OTC top columns: {tops}\n")
             handle.write("ASCII preview:\n")
             handle.write(record.ascii_art + "\n")
             handle.write(
@@ -187,6 +328,24 @@ def dump_examples(examples: Sequence[ExampleRecord], out_dir: Path) -> None:
                     ",".join(f"{value:.3f}" for value in record.duty_cycle),
                 )
             )
+        manifest.append(target_file.name)
+    if metrics is not None:
+        summary_path = out_dir / "report.json"
+        payload = {
+            "top1": metrics.top1,
+            "cer": metrics.cer,
+            "wer": metrics.wer,
+            "avg_fire_rate": metrics.avg_fire_rate,
+            "avg_width": metrics.avg_width,
+            "samples": metrics.samples,
+            "energy_total": metrics.energy_total,
+            "energy_per_pixel": metrics.energy_per_pixel,
+            "duty_cycle": metrics.duty_cycle,
+            "blank_ratio": metrics.blank_ratio,
+            "examples": manifest,
+        }
+        with summary_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
 
 
 def load_checkpoint(path: Path) -> CurriculumModel:
@@ -245,7 +404,7 @@ def evaluate(
     model = load_checkpoint(checkpoint) if checkpoint else load_checkpoint(Path("__missing.ckpt__"))
     total = len(entries)
     if total == 0:
-        return EvalMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0), []
+        return EvalMetrics(0.0, 0.0, 0.0, 0.0, 0.0, 0, 0.0, 0.0, [], 0.0), []
     correct = 0
     total_chars = 0
     total_char_err = 0
@@ -256,7 +415,8 @@ def evaluate(
     energy_total_sum = 0.0
     energy_per_pixel_sum = 0.0
     duty_cycle_sum: List[float] | None = None
-    showcase: List[ExampleRecord] = []
+    blank_ratio_sum = 0.0
+    records: List[ExampleRecord] = []
     for entry in entries:
         image = entry["image"]  # type: ignore[index]
         text = entry["text"]  # type: ignore[index]
@@ -279,6 +439,8 @@ def evaluate(
         total_words += max(1, len(text.split()))
         total_fire += compute_fire_rate(image)
         total_width += len(sequence)
+        blank_series, blank_ratio = _compute_blank_profile(logits)
+        blank_ratio_sum += blank_ratio
         spike_tensor = spikes.encode_ttfs(image, T=ENERGY_TIMESTEPS)
         energy = energy_stats(spike_tensor)
         energy_total_sum += float(energy["total"])
@@ -289,23 +451,41 @@ def evaluate(
                 duty_cycle_sum[idx] += value
         else:
             duty_cycle_sum = [float(value) for value in duty]
-        if len(showcase) < sample_count:
-            aligned_ref, aligned_hyp = align_strings(text, prediction)
-            ascii_art = render.ascii_preview(image)
-            rec = ExampleRecord(
-                path=entry["path"],  # type: ignore[arg-type]
-                text=text,
-                prediction=prediction,
-                cer_value=cer(text, prediction),
-                wer_value=wer(text, prediction),
-                ascii_art=ascii_art,
-                alignment_ref=aligned_ref,
-                alignment_hyp=aligned_hyp,
-                energy_total=int(energy["total"]),
-                energy_per_pixel=float(energy["per_pixel"]),
-                duty_cycle=[float(value) for value in duty],
-            )
-            showcase.append(rec)
+        aligned_ref, aligned_hyp, marks = _alignment_with_marks(text, prediction)
+        ascii_art = render.ascii_preview(image)
+        ctc_tokens, ctc_collapsed = _compute_ctc_path(stage, logits, text)
+        otc_heatmap, otc_top, otc_values = _compute_otc_summary(image)
+        rec = ExampleRecord(
+            path=entry["path"],  # type: ignore[arg-type]
+            text=text,
+            prediction=prediction,
+            cer_value=cer(text, prediction),
+            wer_value=wer(text, prediction),
+            ascii_art=ascii_art,
+            alignment_ref=aligned_ref,
+            alignment_hyp=aligned_hyp,
+            alignment_marks=marks,
+            energy_total=int(energy["total"]),
+            energy_per_pixel=float(energy["per_pixel"]),
+            duty_cycle=[float(value) for value in duty],
+            blank_ratio=blank_ratio,
+            blank_series=[float(value) for value in blank_series],
+            ctc_path=ctc_tokens,
+            ctc_collapsed=ctc_collapsed,
+            otc_heatmap=otc_heatmap,
+            otc_values=otc_values,
+            otc_top_columns=otc_top,
+        )
+        records.append(rec)
+    error_candidates = [rec for rec in records if rec.prediction != rec.text]
+    if not error_candidates:
+        error_candidates = records[:]
+    sorted_errors = sorted(
+        error_candidates,
+        key=lambda rec: (rec.cer_value, rec.wer_value, rec.blank_ratio),
+        reverse=True,
+    )
+    showcase = sorted_errors[: sample_count]
     metrics = EvalMetrics(
         top1=correct / total,
         cer=total_char_err / total_chars if total_chars else 0.0,
@@ -316,6 +496,7 @@ def evaluate(
         energy_total=energy_total_sum / total,
         energy_per_pixel=energy_per_pixel_sum / total,
         duty_cycle=[value / total for value in duty_cycle_sum] if duty_cycle_sum else [],
+        blank_ratio=blank_ratio_sum / total if total else 0.0,
     )
     return metrics, showcase
 
@@ -347,12 +528,13 @@ def run_demo() -> None:
     ensure_dataset(stage, data_dir, size=20)
     metrics, examples = evaluate(stage, data_dir, checkpoint=None, limit=20, sample_count=5)
     vis_dir = Path("runs") / "vis" / stage.lower()
-    dump_examples(examples, vis_dir)
+    dump_examples(examples, vis_dir, metrics)
     print(
         f"Demo metrics ({stage}): top1={metrics.top1:.2f}, "
         f"CER={metrics.cer:.3f}, WER={metrics.wer:.3f}, "
         f"fire={metrics.avg_fire_rate:.3f}, W'={metrics.avg_width:.2f}, "
-        f"energy={metrics.energy_total:.1f}, duty={','.join(f'{v:.3f}' for v in metrics.duty_cycle)}"
+        f"blank={metrics.blank_ratio:.3f}, energy={metrics.energy_total:.1f}, "
+        f"duty={','.join(f'{v:.3f}' for v in metrics.duty_cycle)}"
     )
 
 
@@ -369,7 +551,7 @@ def main() -> None:
         data_dir = args.data
     metrics, examples = evaluate(stage, data_dir, checkpoint=args.ckpt, limit=args.limit, sample_count=args.examples)
     vis_dir = args.vis / stage.lower()
-    dump_examples(examples, vis_dir)
+    dump_examples(examples, vis_dir, metrics)
     print(
         json.dumps(
             {
@@ -383,6 +565,7 @@ def main() -> None:
                 "energy_total": metrics.energy_total,
                 "energy_per_pixel": metrics.energy_per_pixel,
                 "duty_cycle": metrics.duty_cycle,
+                "blank_ratio": metrics.blank_ratio,
             }
         )
     )
@@ -394,10 +577,10 @@ def preview_examples(count: int = 3) -> None:
     ensure_dataset(stage, data_dir, size=20)
     metrics, examples = evaluate(stage, data_dir, checkpoint=None, limit=20, sample_count=count)
     vis_dir = Path("runs") / "vis" / f"{stage.lower()}_preview"
-    dump_examples(examples[:count], vis_dir)
+    dump_examples(examples[:count], vis_dir, metrics)
     print(
         f"Preview ({stage}): saved {min(len(examples), count)} samples to {vis_dir}, "
-        f"avg energy={metrics.energy_total:.1f} spikes"
+        f"avg energy={metrics.energy_total:.1f} spikes, blank={metrics.blank_ratio:.3f}"
     )
 
 

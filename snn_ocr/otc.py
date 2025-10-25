@@ -283,6 +283,11 @@ def ascii_heatmap(values: Sequence[float]) -> str:
     return "".join(output_chars)
 
 
+def column_information(features: FeatureTensor, gate: str = "var") -> List[float]:
+    """Expose the per-column information scores used by the OTC compressor."""
+    return _column_information(features, gate=gate)
+
+
 def _self_check() -> None:
     rng = Random(0)
     features: FeatureTensor = []

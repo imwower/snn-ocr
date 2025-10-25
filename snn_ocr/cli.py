@@ -83,7 +83,7 @@ def cmd_eval(ns: argparse.Namespace) -> None:
     vis_root = Path(ns.vis)
     ensure_dir(vis_root)
     vis_dir = vis_root / stage.lower()
-    dump_examples(examples, vis_dir)
+    dump_examples(examples, vis_dir, metrics)
     print(
         json.dumps(
             {
@@ -97,6 +97,7 @@ def cmd_eval(ns: argparse.Namespace) -> None:
                 "energy_total": metrics.energy_total,
                 "energy_per_pixel": metrics.energy_per_pixel,
                 "duty_cycle": metrics.duty_cycle,
+                "blank_ratio": metrics.blank_ratio,
                 "vis_dir": str(vis_dir),
             }
         )

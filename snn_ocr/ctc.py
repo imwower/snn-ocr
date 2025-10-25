@@ -193,6 +193,11 @@ def _best_alignment_path(
     return alignment
 
 
+def best_alignment_path(logits: Logits, target: Sequence[int], blank: int = 0) -> List[int]:
+    """Public helper that exposes the most likely alignment path for visualization."""
+    return _best_alignment_path(logits, target, blank)
+
+
 def greedy_decode(logits: Logits, blank: int = 0) -> str:
     """Return a collapsed character sequence using greedy decoding."""
     if not logits:
