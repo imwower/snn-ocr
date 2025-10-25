@@ -19,7 +19,8 @@
 12. [训练配方参考](#11-训练配方参考)  
 13. [常见数值问题 FAQ](#12-常见数值问题-faq)  
 14. [标准库 Only 性能建议](#13-标准库-only-性能建议)  
-15. [许可证](#14-许可证)
+15. [验证流程（从快到全）](#14-验证流程从快到全)  
+16. [许可证](#15-许可证)
 
 ---
 
@@ -173,17 +174,17 @@ python -m snn_ocr.cli synth --stage S4 --n 12000 --out data/s4_sentences
 ### 训练
 ```bash
 # S1 分类
-python -m snn_ocr.cli train --stage S1 --data data/s1_digits --epochs 5 --lr 0.003 --batch 8
+python -m snn_ocr.cli train --stage S1 --out runs/s1_baseline --epochs 5 --lr 0.003 --batch 8
 
-# S2 分类 + 重放
-python -m snn_ocr.cli train --stage S2 --data data/s2_letters --replay data/s1_digits --epochs 8
+# S2 分类 + 重放（输入 `--replay 0.1` 表示 10% 上一阶段样本）
+python -m snn_ocr.cli train --stage S2 --out runs/s2_baseline --epochs 8 --batch 8 --replay 0.1
 
 # S3 / S4 CTC
-python -m snn_ocr.cli train --stage S3 --data data/s3_words --epochs 10 --beam 5
-python -m snn_ocr.cli train --stage S4 --data data/s4_sentences --epochs 12 --beam 8
+python -m snn_ocr.cli train --stage S3 --out runs/s3_baseline --epochs 10 --batch 6 --lr 0.002 --clip 0.8
+python -m snn_ocr.cli train --stage S4 --out runs/s4_baseline --epochs 12 --batch 4 --lr 0.0018 --clip 0.7
 
 # 推荐：S3 单词 CTC 训练（目标 CER≤0.18）
-python -m snn_ocr.cli train   --stage S3   --data data/s3_words   --epochs 12   --batch 6   --lr 0.002   --beam 5   --clip 0.7
+python -m snn_ocr.cli train   --stage S3   --epochs 12   --batch 6   --lr 0.002   --clip 0.7   --out runs/s3_recommended
 ```
 
 ### 评估与可视化
@@ -214,42 +215,83 @@ python -m snn_ocr.cli eval \
 
 ## 11. 训练配方参考
 
-以下三档配方均以内置合成数据、标准库 CLI 为前提，命令遵循 `python -m snn_ocr.cli ...` 约定。
+以下配方与 CLI 约定保持一致（所有命令以 `python -m snn_ocr.cli ...` 开头）。
 
-### 11.1 入门速训（≈30 分钟，S1→S2）
-- 目标：S1 Top-1 ≥ 0.985，S2 Top-1 ≥ 0.94。
-- 命令示例：
-  ```bash
-  python -m snn_ocr.cli synth --stage S1 --n 1500 --out data/s1_digits
-  python -m snn_ocr.cli synth --stage S2 --n 2000 --out data/s2_letters
-  python -m snn_ocr.cli train --stage S1 --data data/s1_digits --epochs 6 --batch 8 --lr 0.004
-  python -m snn_ocr.cli train --stage S2 --data data/s2_letters --epochs 8 --batch 8 --lr 0.003 --replay 0.1
-  ```
-- 调参：若 Top-1 未达标，增大 `--epochs`（+2）或降低 `--lr` 0.0005。
+> `train` 子命令基于课程采样器，不需要 `--data`/`--beam`/`--T` 等数据路径参数；`synth` 生成的数据可用于评估、可视化或回归基准。
 
-### 11.2 中阶单词（≈2 小时，S1→S3）
-- 目标：S3 CER ≤ 0.18，WER ≤ 0.28，平均脉冲总量≤3.8e3。
-- 命令示例：
-  ```bash
-  python -m snn_ocr.cli synth --stage S3 --n 9000 --out data/s3_words
-  python -m snn_ocr.cli train --stage S2 --data data/s2_letters --epochs 10 --batch 12 --lr 0.003 --replay 0.15
-  python -m snn_ocr.cli train --stage S3 --data data/s3_words --epochs 12 --batch 6 --lr 0.002 --beam 5 --clip 0.7
-  ```
-- 预期指标：`train` 日志中 `cer≈0.17±0.02`，OTC 输出 `W→W' ≈ 48→16`。
-- 监控：如脉冲超过阈值，将 `spikes.encode_poisson` 的 `rate_scale` 调低至 0.9（在 `snn_ocr/spikes.py` 中）。
+### 11.1 Smoke 快速验证（10–20 分钟）
+目标：S1 Top‑1 ≥ 90%，S2 Top‑1 ≥ 85%，S3 CER ≤ 0.40，S4 CER ≤ 0.55。
 
-### 11.3 句子全链（≈4 小时，S1→S4）
-- 目标：S4 CER ≤ 0.25，WER ≤ 0.42；平均 blank 占比 0.55±0.05。
-- 命令示例：
-  ```bash
-  python -m snn_ocr.cli synth --stage S4 --n 15000 --out data/s4_sentences --seed 11
-  python -m snn_ocr.cli train --stage S3 --data data/s3_words --epochs 14 --batch 6 --lr 0.0018 --beam 6
-  python -m snn_ocr.cli train --stage S4 --data data/s4_sentences --epochs 18 --batch 4 --lr 0.0015 \
-      --beam 8 --cosine --clip 0.6 --distill --teacher runs/s3/ckpt.json
-  python -m snn_ocr.cli eval --stage S4 --data data/s4_sentences --ckpt runs/s4/ckpt.json --examples 8
-  ```
-- 评估：`runs/vis/s4/report.json` 应显示 `top1≈0.62`、`blank_ratio≈0.56`、`duty` 呈平缓下降。
-- 若 CER 卡在 0.3，可尝试：`--distill-lambda 0.4`、增大 `--warmup-steps 300`、调低 OTC `target_width` 至输入宽度的 1/4。
+```bash
+# S1：生成 + 速训 + 验证
+python -m snn_ocr.cli synth --stage S1 --n 1200 --out data/s1_smoke --width 28 --height 28 --seed 7
+python -m snn_ocr.cli train --stage S1 --out runs/s1_smoke --epochs 3 --batch 8 --lr 0.003 \
+  --warmup-steps 200 --cosine --clip 1.0
+python -m snn_ocr.cli eval  --stage S1 --data data/s1_smoke --ckpt runs/s1_smoke/ckpt.json
+
+# S2：加入 10% 重放
+python -m snn_ocr.cli synth --stage S2 --n 2400 --out data/s2_smoke
+python -m snn_ocr.cli train --stage S2 --out runs/s2_smoke --epochs 4 --batch 8 --replay 0.1 \
+  --lr 0.003 --warmup-steps 200 --cosine --clip 1.0
+
+# S3：CTC 小束宽
+python -m snn_ocr.cli synth --stage S3 --n 3000 --out data/s3_smoke
+python -m snn_ocr.cli train --stage S3 --out runs/s3_smoke --epochs 5 --batch 4 --lr 0.002 --clip 0.8
+python -m snn_ocr.cli eval  --stage S3 --data data/s3_smoke --ckpt runs/s3_smoke/ckpt.json --examples 5
+
+# S4：CTC 长序列
+python -m snn_ocr.cli synth --stage S4 --n 4000 --out data/s4_smoke
+python -m snn_ocr.cli train --stage S4 --out runs/s4_smoke --epochs 6 --batch 4 --lr 0.0018 --clip 0.7
+python -m snn_ocr.cli eval  --stage S4 --data data/s4_smoke --ckpt runs/s4_smoke/ckpt.json --examples 6
+```
+
+若未达标，优先检查：`--clip` 与 `--warmup-steps` 是否生效、`eval` 输出的 `blank_ratio` 是否落在 0.4–0.8 区间。
+
+### 11.2 Standard（默认推荐链路）
+目标：S1 Top‑1 ≥ 96%，S2 Top‑1 ≥ 93%，S3 CER ≤ 0.25，S4 CER ≤ 0.35，同时保持 OTC `W→W' ≥ 3×`。
+
+```bash
+# S1：8 个 epoch，余弦退火
+python -m snn_ocr.cli synth --stage S1 --n 6000 --out data/s1_digits --width 28 --height 28 --seed 7
+python -m snn_ocr.cli train --stage S1 --out runs/s1 --epochs 8 --batch 8 --lr 0.003 \
+  --warmup-steps 500 --cosine --clip 1.0
+
+# S2：15% 重放 + 蒸馏
+python -m snn_ocr.cli synth --stage S2 --n 12000 --out data/s2_letters
+python -m snn_ocr.cli train --stage S2 --out runs/s2 --epochs 10 --batch 8 --lr 0.003 \
+  --replay 0.15 --distill --distill-lambda 0.3 --distill-temp 2.0 \
+  --warmup-steps 500 --cosine --clip 1.0
+
+# S3：更长序列、定期 DEV
+python -m snn_ocr.cli synth --stage S3 --n 20000 --out data/s3_words
+python -m snn_ocr.cli train --stage S3 --out runs/s3 --epochs 12 --batch 6 --lr 0.002 \
+  --clip 0.7 --dev-steps 10 --dev-every 2 --save-every 500
+python -m snn_ocr.cli eval  --stage S3 --data data/s3_words --ckpt runs/s3/ckpt.json --examples 8
+
+# S4：蒸馏 + 断点监控
+python -m snn_ocr.cli synth --stage S4 --n 30000 --out data/s4_sentences
+python -m snn_ocr.cli train --stage S4 --out runs/s4 --epochs 16 --batch 4 --lr 0.0015 \
+  --clip 0.6 --cosine --distill --teacher runs/s3/ckpt.json --save-every 400
+python -m snn_ocr.cli eval  --stage S4 --data data/s4_sentences --ckpt runs/s4/ckpt.json --examples 8
+```
+
+若 CER 上不去，可：调低 `--lr` 0.0003、增大 `--warmup-steps`、在 `spikes.encode_poisson` 中将 `rate_scale` 调至 0.9。
+
+### 11.3 Repro（多 Seed 聚合）
+目标：多次训练后的 CER/WER 方差 ≤ 0.01，并产出 `repro.json` 记录超参、commit 与环境。
+
+```bash
+for SEED in 3 7 13; do
+  python -m snn_ocr.cli train --stage S4 --out runs/s4_seed${SEED} --epochs 10 --batch 4 \
+    --lr 0.003 --warmup-steps 500 --cosine --clip 1.0 --seed $SEED
+  python -m snn_ocr.cli repro --stage S4 --seed $SEED --ckpt runs/s4_seed${SEED}/ckpt.json \
+    --command "python -m snn_ocr.cli train --stage S4 --seed $SEED ..." \
+    --out runs/repro/s4_seed${SEED}.json
+done
+# 训练结束后，可写一个三十行脚本统计 CER/WER 的均值、方差并对 error bucket 做复盘。
+```
+
+建议在 `runs/repro/` 下保留 `vis_dir` / `report.json` 路径，方便日后回溯 Top‑K 错误样例。
 
 ## 12. 常见数值问题 FAQ
 
@@ -269,13 +311,33 @@ python -m snn_ocr.cli eval \
 ## 13. 标准库 Only 性能建议
 
 1. **预分配列表**：在卷积、OTC 等核心循环中使用 `[0.0 for _ in range(n)]` 一次性创建，再用索引覆写，避免频繁 `append`。
-2. **memoryview/bytearray**：PGM/PPM IO 或 spike tensor 转换时用 `memoryview(bytearray(...))` 原位操作，减少复制。
-3. **行缓冲卷积**：在 `lif._linear_conv2d` 等函数内缓存上一行的 padded 结果，可将重复访问降至 O(1)。
-4. **减少对象创建**：训练循环里复用 `dict` / `list` 模板 (`template = [0.0]*C`)，避免在每次前向重新构造。
-5. **批量随机数**：`random.Random` 上使用 `randint/gauss` 优先批量生成列表，再迭代使用；伪随机抖动使用 `itertools.cycle` 重用序列。
-6. **解析器/日志**：CLI 输出采用行缓冲 `print(json.dumps(...))`，不要频繁 flush；训练日志写入 `metrics.jsonl`，减少 stdout 压力。
+2. **memoryview/bytearray/array**：PGM/PPM IO、spike tensor 和中间特征使用 `memoryview(bytearray(...))` 或 `array('h')` 原位操作，减少复制与 GC 压力。
+3. **行缓冲 + 滑窗**：在 `lif._linear_conv2d` / `conv1d` 中缓存上一行/列的 padded 结果，同时预计算滑窗索引，避免重复切片和 `range` 重新构造。
+4. **减少对象创建**：训练循环里复用 `dict` / `list` 模板 (`template = [0.0]*C`)；跨步的 `grad`、`log_probs` 可以从 `model.grad_template()` 拷贝而不是新建。
+5. **批量随机 & 统一种子**：所有模块经由 `random.Random(seed)` 创建，并提前生成列表再循环消费；`synth/train/eval` 共用同一个 seed 以便 repro。
+6. **稳定的 log_sum_exp**：提取公共实现、统一 `epsilon` 与裁剪，避免在循环内创建临时列表或重复计算 `math.exp`。
+7. **OTC 信息量**：方差/熵都要做极小值钳制；合并时保持列序不变；DP 方案建议使用前缀和 + 一维 `best[k]`，复杂度 O(W·K)。
+8. **日志与聚合**：训练日志写入 JSONL（每行一个 dict），CLI 输出一次只打印一行；配合一个 30 行的脚本即可聚合 loss/CER。
 
-## 14. 许可证
+## 14. 验证流程（从快到全）
+
+### 14.1 自检（必须先过）
+- 命令：`python scripts/self_check.py` 或 `python -m snn_ocr.cli doctor`。
+- 通过标准：终端打印 `非标准库依赖 0 条`；关键 API 均为 `OK`；`missing.json` 被生成/更新且仅记录缺失项。
+
+### 14.2 Smoke 验证（功能完整性）
+- 数据：使用 [11.1 Smoke](#111-smoke-快速验证10–20-分钟) 命令生成。
+- 通过标准：各阶段命令可独立跑通，S3/S4 的 `blank_ratio` 介于 0.4–0.8，能耗代理（脉冲总数 / 像素 / duty）随 `T` 增大而单调上升。
+
+### 14.3 Standard 验证（数值与稳定性）
+- 数据：使用 [11.2 Standard](#112-standard默认推荐链路) 命令生成。
+- 通过标准：指标达到目标值；打开/关闭 OTC 时 W→W′ 曲线合理且 CER 无显著回退；断点恢复（`--resume`）后首个 epoch 的 loss 差 < 1e‑6。
+
+### 14.4 Repro（多 seed 聚合）
+- 数据：使用 [11.3 Repro](#113-repro多-seed-聚合) 工程流程。
+- 通过标准：3 个 seed 的 CER/WER 方差 ≤ 0.01；`runs/repro/*.json` 记录 seed、命令行、git commit 与系统信息；`runs/vis/` 的 Top‑K error 可回溯到图片/路径。
+
+## 15. 许可证
 
 MIT License，详见仓库根目录的 `LICENSE` 文件。
 - 代码与 5×7 / 7×9 位图字体均遵循 **MIT License**。
