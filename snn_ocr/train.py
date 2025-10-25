@@ -527,12 +527,35 @@ def grad_norm(grad: Gradients) -> float:
     return math.sqrt(total)
 
 
-def clip_gradient(grad: Gradients, max_norm: float) -> float:
-    norm = grad_norm(grad)
-    if norm > max_norm and max_norm > 0.0:
-        scale = max_norm / (norm + 1e-12)
+def clip_gradient(grad: Gradients, threshold: float, mode: str = "norm") -> float:
+    norm_before = grad_norm(grad)
+    if threshold <= 0.0:
+        return norm_before
+    mode = mode.lower()
+    if mode == "value":
+        limit = float(threshold)
+        for name in grad:
+            weights = grad[name]["weights"]  # type: ignore[index]
+            bias = grad[name]["bias"]  # type: ignore[index]
+            for row in weights:
+                for idx in range(len(row)):
+                    value = row[idx]
+                    if value > limit:
+                        row[idx] = limit
+                    elif value < -limit:
+                        row[idx] = -limit
+            for idx in range(len(bias)):
+                value = bias[idx]
+                if value > limit:
+                    bias[idx] = limit
+                elif value < -limit:
+                    bias[idx] = -limit
+        return grad_norm(grad)
+    norm = norm_before
+    if norm > threshold:
+        scale = threshold / (norm + 1e-12)
         scale_grad(grad, scale)
-        return norm * scale
+        return threshold
     return norm
 
 
@@ -893,7 +916,9 @@ class TrainArgs:
     lr: float
     min_lr: float
     cosine_anneal: bool
+    warmup_steps: int
     clip_grad: float
+    clip_mode: str
     replay_override: float | None
     resume: bool
     log_every: int
@@ -902,6 +927,11 @@ class TrainArgs:
     distill: bool
     distill_lambda: float
     teacher_ckpt: Path | None
+    dev_steps: int
+    dev_batch: int
+    dev_every: int
+    early_stop_patience: int
+    early_stop_metric: str
 
 
 @dataclass
@@ -946,6 +976,7 @@ def run_epoch(
     *,
     lr_fn: Callable[[int], float],
     clip_grad: float,
+    clip_mode: str,
     train_segments: Tuple[str, ...],
     log_every: int,
     metrics_file: TextIO,
@@ -956,9 +987,10 @@ def run_epoch(
     rng: Random,
     teacher_model: CurriculumModel | None,
     kd_lambda: float,
-) -> Tuple[int, float | None, float | None]:
+) -> Tuple[int, float | None, float | None, Dict[str, object] | None]:
     first_loss: float | None = None
     last_loss: float | None = None
+    latest_log_entry: Dict[str, object] | None = None
     for batch in loader:
         global_step += 1
         lr = lr_fn(global_step)
@@ -975,6 +1007,10 @@ def run_epoch(
         total_kd = 0.0
         old_correct = 0
         old_total = 0
+        energy_total = 0.0
+        energy_per_pixel_total = 0.0
+        energy_per_column_total = 0.0
+        duty_cycle_accum: List[float] | None = None
         for sample in batch:
             sequence = image_to_sequence(sample.gray)
             if not sequence:
@@ -999,7 +1035,17 @@ def run_epoch(
                 cer_total += breakdown.cer
                 wer_total += breakdown.wer
                 cer_count += 1
-            total_fire += compute_fire_rate(sample.gray)
+            energy = compute_energy_proxy(sample.gray)
+            total_fire += float(energy["fire_rate"])
+            energy_total += float(energy["total"])
+            energy_per_pixel_total += float(energy["per_pixel"])
+            energy_per_column_total += float(energy["per_column"])
+            duty_cycle = energy["duty_cycle"]  # type: ignore[assignment]
+            if isinstance(duty_cycle, list):
+                if duty_cycle_accum is None:
+                    duty_cycle_accum = [0.0 for _ in duty_cycle]
+                for idx, value in enumerate(duty_cycle):
+                    duty_cycle_accum[idx] += value
             width = len(sample.gray[0]) if sample.gray and sample.gray[0] else 1
             total_width_ratio += len(sequence) / max(1, width)
             sample_count += 1
@@ -1024,7 +1070,15 @@ def run_epoch(
         avg_wer = (wer_total / cer_count) if cer_count else None
         old_top1 = (old_correct / old_total) if old_total else None
         grad_norm_before = grad_norm(grad_accum)
-        grad_norm_after = clip_gradient(grad_accum, clip_grad)
+        grad_norm_after = clip_gradient(grad_accum, clip_grad, mode=clip_mode)
+        energy_total_avg = energy_total * inv_batch
+        energy_per_pixel_avg = energy_per_pixel_total * inv_batch
+        energy_per_column_avg = energy_per_column_total * inv_batch
+        duty_cycle_avg = (
+            [value * inv_batch for value in duty_cycle_accum]
+            if duty_cycle_accum
+            else []
+        )
         if isinstance(optimizer, (SGDOptimizer, AdamOptimizer)):
             optimizer.step(model, grad_accum, lr, train_segments)
         if first_loss is None:
@@ -1043,6 +1097,10 @@ def run_epoch(
                 "grad_norm_clipped": grad_norm_after,
                 "fire_rate": avg_fire,
                 "width_ratio": avg_width_ratio,
+                "energy_total": energy_total_avg,
+                "energy_per_pixel": energy_per_pixel_avg,
+                "energy_per_column": energy_per_column_avg,
+                "duty_cycle": duty_cycle_avg,
             }
             if avg_cer is not None:
                 log_entry["cer"] = avg_cer
@@ -1052,9 +1110,10 @@ def run_epoch(
                 log_entry["old_top1"] = old_top1
             metrics_file.write(json.dumps(log_entry) + "\n")
             metrics_file.flush()
+            latest_log_entry = log_entry
             msg = (
                 f"[step {global_step}] loss={batch_loss:.4f} main={batch_main:.4f} smooth={batch_smooth:.4f} "
-                f"lr={lr:.5f} fire={avg_fire:.3f} W'={avg_width_ratio:.2f}"
+                f"lr={lr:.5f} fire={avg_fire:.3f} W'={avg_width_ratio:.2f} energy={energy_total_avg:.2f}"
             )
             if batch_kd > 0.0:
                 msg += f" kd={batch_kd:.4f}"
@@ -1066,8 +1125,8 @@ def run_epoch(
                 msg += f" old={old_top1:.3f}"
             print(msg)
         if global_step % save_every == 0:
-            save_ckpt(ckpt_path, model, optimizer, global_step, samplers, rng)
-    return global_step, first_loss, last_loss
+            save_ckpt(ckpt_path, model, optimizer, global_step, samplers, rng, latest_log_entry)
+    return global_step, first_loss, last_loss, latest_log_entry
 
 
 def find_teacher_checkpoint(stage_cfg: StageConfig, out_dir: Path, override: Path | None) -> Path | None:
@@ -1106,12 +1165,15 @@ def train_stage(args: TrainArgs) -> TrainingResult:
     optimizer = create_optimizer(args.optimizer, model)
     sampler_names = {stage_cfg.name, *stage_cfg.previous}
     samplers: Dict[str, StageSampler] = {name: StageSampler(name) for name in sampler_names}
+    dev_sampler_key = f"{stage_cfg.name}_dev"
+    samplers[dev_sampler_key] = StageSampler(stage_cfg.name)
     rng = Random(args.seed)
     global_step = 0
     result = TrainingResult(stage=stage_cfg.name, steps=0, initial_loss=None, final_loss=None)
 
+    ckpt_tail: Dict[str, object] | None = None
     if args.resume and ckpt_path.exists():
-        global_step = load_ckpt(ckpt_path, model, optimizer, samplers, rng)
+        global_step, ckpt_tail = load_ckpt(ckpt_path, model, optimizer, samplers, rng)
         if metrics_path.exists():
             try:
                 with metrics_path.open("r", encoding="utf-8") as handle:
@@ -1123,6 +1185,8 @@ def train_stage(args: TrainArgs) -> TrainingResult:
                     result.final_loss = float(last.get("loss"))
             except json.JSONDecodeError:
                 pass
+    last_logged_metrics = _read_last_metrics(metrics_path)
+    _verify_resume_alignment(ckpt_tail, last_logged_metrics)
 
     total_steps = max(1, args.epochs * max(1, args.steps_per_epoch))
     metrics_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1144,12 +1208,27 @@ def train_stage(args: TrainArgs) -> TrainingResult:
                 print(f"[distill] Failed to load teacher from {teacher_path}, disabling KD.")
                 teacher_model = None
 
+    warmup_steps = max(0, args.warmup_steps)
+    clip_mode = args.clip_mode.lower()
+
     def lr_fn(step: int) -> float:
-        if not args.cosine_anneal:
-            return args.lr
-        return cosine_anneal(args.lr, args.min_lr, step, total_steps)
+        if warmup_steps > 0 and step <= warmup_steps:
+            return args.lr * step / max(1, warmup_steps)
+        if args.cosine_anneal:
+            effective_total = max(1, total_steps - warmup_steps)
+            effective_step = max(0, step - warmup_steps)
+            return cosine_anneal(args.lr, args.min_lr, effective_step, effective_total)
+        return args.lr
+
+    latest_log_entry: Dict[str, object] | None = last_logged_metrics
+    dev_enabled = args.dev_steps > 0
+    dev_every = max(1, args.dev_every)
+    best_metric = math.inf if args.early_stop_metric == "cer" else -math.inf
+    epochs_no_improve = 0
+    early_stop_active = dev_enabled and args.early_stop_patience > 0
 
     try:
+        stop_training = False
         for epoch in range(args.epochs):
             loader = build_loader(
                 stage_cfg,
@@ -1160,7 +1239,7 @@ def train_stage(args: TrainArgs) -> TrainingResult:
                 replay_ratio=replay_ratio,
                 buffers=buffers,
             )
-            global_step, first_loss, last_loss = run_epoch(
+            global_step, first_loss, last_loss, latest_log_entry = run_epoch(
                 model,
                 loader,
                 optimizer,
@@ -1168,6 +1247,7 @@ def train_stage(args: TrainArgs) -> TrainingResult:
                 stage_cfg,
                 lr_fn=lr_fn,
                 clip_grad=args.clip_grad,
+                clip_mode=args.clip_mode,
                 train_segments=stage_cfg.train_segments,
                 log_every=args.log_every,
                 metrics_file=metrics_file,
@@ -1184,20 +1264,75 @@ def train_stage(args: TrainArgs) -> TrainingResult:
             if last_loss is not None:
                 result.final_loss = last_loss
             result.steps = global_step
+            run_dev = dev_enabled and ((epoch + 1) % dev_every == 0)
+            if run_dev:
+                dev_metrics = evaluate_dev_metrics(
+                    model,
+                    samplers[dev_sampler_key],
+                    stage_cfg,
+                    batches=args.dev_steps,
+                    batch_size=args.dev_batch,
+                )
+                dev_entry = {
+                    "iter": global_step,
+                    "stage": stage_cfg.name,
+                    "phase": "dev",
+                    "cer": dev_metrics["cer"],
+                    "top1": dev_metrics["top1"],
+                }
+                metrics_file.write(json.dumps(dev_entry) + "\n")
+                metrics_file.flush()
+                latest_log_entry = dev_entry
+                metric_value = dev_metrics[args.early_stop_metric]
+                improved = (
+                    metric_value < best_metric - 1e-9
+                    if args.early_stop_metric == "cer"
+                    else metric_value > best_metric + 1e-9
+                )
+                if improved:
+                    best_metric = metric_value
+                    epochs_no_improve = 0
+                    save_ckpt(ckpt_path, model, optimizer, global_step, samplers, rng, latest_log_entry)
+                else:
+                    epochs_no_improve += 1
+                    if early_stop_active and epochs_no_improve >= args.early_stop_patience:
+                        print("[early-stop] Patience exceeded; stopping training.")
+                        stop_training = True
+                        break
     finally:
         metrics_file.close()
-    save_ckpt(ckpt_path, model, optimizer, global_step, samplers, rng)
+    save_ckpt(ckpt_path, model, optimizer, global_step, samplers, rng, latest_log_entry)
     return result
 
 
-def compute_fire_rate(gray: List[List[int]], timesteps: int = 4) -> float:
+def compute_energy_proxy(gray: List[List[int]], timesteps: int = 4) -> Dict[str, object]:
     spikes_tensor = spikes.encode_ttfs(gray, T=timesteps)
     total_spikes = 0
-    for frame in spikes_tensor:
+    height = len(gray)
+    width = len(gray[0]) if height else 0
+    pixels = max(1, height * width)
+    duty_cycle: List[float] = [0.0 for _ in range(timesteps)]
+    for t, frame in enumerate(spikes_tensor):
+        frame_spikes = 0
         for row in frame:
-            total_spikes += sum(row)
-    total_possible = timesteps * len(gray) * len(gray[0]) if gray and gray[0] else 1
-    return total_spikes / total_possible
+            frame_spikes += sum(row)
+        total_spikes += frame_spikes
+        duty_cycle[t] = frame_spikes / pixels
+    per_pixel = total_spikes / pixels
+    per_column = total_spikes / max(1, width)
+    total_possible = timesteps * pixels
+    fire_rate = total_spikes / max(1, total_possible)
+    return {
+        "total": float(total_spikes),
+        "per_pixel": float(per_pixel),
+        "per_column": float(per_column),
+        "duty_cycle": duty_cycle,
+        "fire_rate": float(fire_rate),
+    }
+
+
+def compute_fire_rate(gray: List[List[int]], timesteps: int = 4) -> float:
+    return float(compute_energy_proxy(gray, timesteps)["fire_rate"])
 
 
 def load_ckpt(
@@ -1206,9 +1341,9 @@ def load_ckpt(
     optimizer: object,
     samplers: Dict[str, StageSampler],
     rng: Random,
-) -> int:
+) -> Tuple[int, Dict[str, object] | None]:
     if not path.exists():
-        return 0
+        return 0, None
     with path.open("r", encoding="utf-8") as handle:
         state = json.load(handle)
     model_state = state.get("model")
@@ -1228,7 +1363,8 @@ def load_ckpt(
     rng_state = state.get("rng")
     if isinstance(rng_state, dict):
         deserialize_rng(rng, rng_state)
-    return int(state.get("step", 0))
+    metrics_tail = state.get("metrics_tail")
+    return int(state.get("step", 0)), metrics_tail
 
 
 def save_ckpt(
@@ -1238,6 +1374,7 @@ def save_ckpt(
     step: int,
     samplers: Dict[str, StageSampler],
     rng: Random,
+    metrics_tail: Dict[str, object] | None,
 ) -> None:
     state = {
         "model": model.state_dict(),
@@ -1246,6 +1383,8 @@ def save_ckpt(
         "samplers": {name: sampler.state_dict() for name, sampler in samplers.items()},
         "rng": serialize_rng(rng),
     }
+    if metrics_tail is not None:
+        state["metrics_tail"] = metrics_tail
     with path.open("w", encoding="utf-8") as handle:
         json.dump(state, handle)
 
@@ -1253,6 +1392,80 @@ def save_ckpt(
 # ---------------------------------------------------------------------------
 # CLI & demo
 # ---------------------------------------------------------------------------
+
+
+def _read_last_metrics(path: Path) -> Dict[str, object] | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            lines = [line.strip() for line in handle if line.strip()]
+    except OSError:
+        return None
+    if not lines:
+        return None
+    try:
+        return json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+
+
+def _verify_resume_alignment(
+    tail_ckpt: Dict[str, object] | None,
+    tail_file: Dict[str, object] | None,
+    tol: float = 1e-6,
+) -> None:
+    if not tail_ckpt or not tail_file:
+        return
+    for key in ("loss", "main_loss", "smooth_loss"):
+        if key in tail_ckpt and key in tail_file:
+            try:
+                ck = float(tail_ckpt[key])
+                lf = float(tail_file[key])
+            except (TypeError, ValueError):
+                continue
+            if abs(ck - lf) > tol:
+                raise RuntimeError(
+                    f"Checkpoint mismatch for {key}: {ck} vs {lf} (tol={tol})"
+                )
+
+
+def evaluate_dev_metrics(
+    model: CurriculumModel,
+    sampler: StageSampler,
+    stage_cfg: StageConfig,
+    *,
+    batches: int,
+    batch_size: int,
+) -> Dict[str, float]:
+    if batches <= 0 or batch_size <= 0:
+        return {"top1": 0.0, "cer": 1.0}
+    total = 0
+    correct = 0
+    total_chars = 0
+    total_cer = 0.0
+    for _ in range(batches):
+        for _ in range(batch_size):
+            gray, text = sampler.next_sample()
+            sequence = image_to_sequence(gray)
+            if not sequence:
+                continue
+            logits = model.forward(sequence)
+            prediction = decode_prediction(stage_cfg.name, logits)
+            target = text
+            if stage_cfg.loss_type == "ce" and text:
+                target = text[0]
+            if prediction == target:
+                correct += 1
+            total += 1
+            total_cer += compute_cer(target, prediction)
+            total_chars += max(1, len(target))
+    if total == 0:
+        return {"top1": 0.0, "cer": 1.0}
+    return {
+        "top1": correct / total,
+        "cer": total_cer / max(1, total_chars),
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -1265,12 +1478,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--optimizer", type=str, choices=["sgd", "adam"], default="adam")
     parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--min-lr", type=float, default=0.001)
+    parser.add_argument("--warmup-steps", type=int, default=0)
     parser.add_argument("--cosine", action="store_true")
     parser.add_argument("--clip", type=float, default=1.0)
+    parser.add_argument("--clip-mode", choices=["norm", "value"], default="norm")
     parser.add_argument("--replay", type=float, default=None)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=200)
+    parser.add_argument("--dev-steps", type=int, default=0)
+    parser.add_argument("--dev-batch", type=int, default=8)
+    parser.add_argument("--dev-every", type=int, default=1)
+    parser.add_argument("--early-stop-patience", type=int, default=0)
+    parser.add_argument("--early-stop-metric", choices=["cer", "top1"], default="cer")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--distill", action="store_true", help="Enable lightweight LwF knowledge distillation.")
     parser.add_argument(
@@ -1296,7 +1516,9 @@ def run_demo() -> None:
         lr=0.02,
         min_lr=0.005,
         cosine_anneal=True,
+        warmup_steps=5,
         clip_grad=1.0,
+        clip_mode="norm",
         replay_override=None,
         resume=False,
         log_every=5,
@@ -1305,6 +1527,11 @@ def run_demo() -> None:
         distill=False,
         distill_lambda=0.0,
         teacher_ckpt=None,
+        dev_steps=0,
+        dev_batch=8,
+        dev_every=1,
+        early_stop_patience=0,
+        early_stop_metric="cer",
     )
     result = train_stage(demo_args)
     if result.initial_loss is not None and result.final_loss is not None:
@@ -1330,7 +1557,9 @@ def main() -> None:
         lr=args_ns.lr,
         min_lr=args_ns.min_lr,
         cosine_anneal=args_ns.cosine,
+        warmup_steps=args_ns.warmup_steps,
         clip_grad=args_ns.clip,
+        clip_mode=args_ns.clip_mode,
         replay_override=args_ns.replay,
         resume=args_ns.resume,
         log_every=args_ns.log_every,
@@ -1339,6 +1568,11 @@ def main() -> None:
         distill=args_ns.distill,
         distill_lambda=args_ns.distill_lambda,
         teacher_ckpt=args_ns.teacher,
+        dev_steps=args_ns.dev_steps,
+        dev_batch=args_ns.dev_batch,
+        dev_every=args_ns.dev_every,
+        early_stop_patience=args_ns.early_stop_patience,
+        early_stop_metric=args_ns.early_stop_metric,
     )
     train_stage(train_args)
 

@@ -34,7 +34,9 @@ def cmd_train(ns: argparse.Namespace) -> None:
         lr=ns.lr,
         min_lr=ns.min_lr,
         cosine_anneal=ns.cosine,
+        warmup_steps=ns.warmup_steps,
         clip_grad=ns.clip,
+        clip_mode=ns.clip_mode,
         replay_override=ns.replay,
         resume=ns.resume,
         log_every=ns.log_every,
@@ -43,6 +45,11 @@ def cmd_train(ns: argparse.Namespace) -> None:
         distill=ns.distill,
         distill_lambda=ns.distill_lambda,
         teacher_ckpt=Path(ns.teacher) if ns.teacher else None,
+        dev_steps=ns.dev_steps,
+        dev_batch=ns.dev_batch,
+        dev_every=ns.dev_every,
+        early_stop_patience=ns.early_stop_patience,
+        early_stop_metric=ns.early_stop_metric,
     )
     result = train_stage(train_args)
     print(
@@ -130,12 +137,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser_train.add_argument("--optimizer", type=str, choices=["sgd", "adam"], default="adam")
     parser_train.add_argument("--lr", type=float, default=0.01)
     parser_train.add_argument("--min-lr", type=float, default=0.001)
+    parser_train.add_argument("--warmup-steps", type=int, default=0)
     parser_train.add_argument("--cosine", action="store_true")
     parser_train.add_argument("--clip", type=float, default=1.0)
+    parser_train.add_argument("--clip-mode", choices=["norm", "value"], default="norm")
     parser_train.add_argument("--replay", type=float, default=None)
     parser_train.add_argument("--resume", action="store_true")
     parser_train.add_argument("--log-every", type=int, default=10)
     parser_train.add_argument("--save-every", type=int, default=200)
+    parser_train.add_argument("--dev-steps", type=int, default=0, help="Number of evaluation batches for dev metrics.")
+    parser_train.add_argument("--dev-batch", type=int, default=8, help="Batch size for dev evaluation.")
+    parser_train.add_argument("--dev-every", type=int, default=1, help="Evaluate dev metrics every N epochs when >0.")
+    parser_train.add_argument(
+        "--early-stop-patience",
+        type=int,
+        default=0,
+        help="Enable early stopping after N epochs without improvement (0 disables).",
+    )
+    parser_train.add_argument(
+        "--early-stop-metric",
+        choices=["cer", "top1"],
+        default="cer",
+        help="Metric to monitor when early stopping is enabled.",
+    )
     parser_train.add_argument("--seed", type=int, default=7)
     parser_train.add_argument("--distill", action="store_true", help="Enable knowledge distillation (LwF).")
     parser_train.add_argument(
