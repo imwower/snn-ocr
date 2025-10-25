@@ -21,10 +21,11 @@ def cmd_synth(ns: argparse.Namespace) -> None:
 
 
 def cmd_train(ns: argparse.Namespace) -> None:
-    out_dir = Path(ns.out) if ns.out else Path("runs") / ns.stage.lower()
+    stage = ns.stage.upper()
+    out_dir = Path(ns.out) if ns.out else Path("runs") / stage.lower()
     ensure_dir(out_dir)
     train_args = TrainArgs(
-        stage=ns.stage,
+        stage=stage,
         out_dir=out_dir,
         epochs=ns.epochs,
         steps_per_epoch=ns.steps,
@@ -65,7 +66,9 @@ def cmd_eval(ns: argparse.Namespace) -> None:
         limit=ns.limit,
         sample_count=ns.examples,
     )
-    vis_dir = Path(ns.vis) / stage.lower()
+    vis_root = Path(ns.vis)
+    ensure_dir(vis_root)
+    vis_dir = vis_root / stage.lower()
     dump_examples(examples, vis_dir)
     print(
         json.dumps(
@@ -77,6 +80,9 @@ def cmd_eval(ns: argparse.Namespace) -> None:
                 "fire_rate": metrics.avg_fire_rate,
                 "width_out": metrics.avg_width,
                 "samples": metrics.samples,
+                "energy_total": metrics.energy_total,
+                "energy_per_pixel": metrics.energy_per_pixel,
+                "duty_cycle": metrics.duty_cycle,
                 "vis_dir": str(vis_dir),
             }
         )
@@ -99,7 +105,11 @@ def cmd_preview(ns: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="snn_ocr.cli", description="SNN-OCR command line interface.")
+    parser = argparse.ArgumentParser(
+        prog="snn_ocr.cli",
+        description="SNN-OCR command line interface.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     parser_synth = subparsers.add_parser("synth", help="Generate curriculum samples.")

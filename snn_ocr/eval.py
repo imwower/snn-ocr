@@ -5,7 +5,6 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from random import Random
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 import sys
@@ -13,13 +12,13 @@ import sys
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from snn_ocr import pgm, render, synth
+from snn_ocr import pgm, render, synth, spikes
 from snn_ocr.ctc import greedy_decode, symbol_table
 from snn_ocr.train import (
     BLANK_INDEX,
     CHAR_TO_INDEX,
     STAGE_CONFIGS,
-    SequenceLinear,
+    CurriculumModel,
     compute_fire_rate,
     image_to_sequence,
     softmax,
@@ -27,6 +26,7 @@ from snn_ocr.train import (
 )
 
 SYMBOLS: Tuple[str, ...] = symbol_table()
+ENERGY_TIMESTEPS = 6
 
 
 def edit_distance(seq_a: Sequence[str], seq_b: Sequence[str]) -> int:
@@ -105,6 +105,35 @@ def align_strings(ref: str, hyp: str) -> Tuple[str, str]:
     return "".join(reversed(aligned_ref)), "".join(reversed(aligned_hyp))
 
 
+def energy_stats(spike_tensor: Sequence[Sequence[Sequence[int]]]) -> Dict[str, object]:
+    if not spike_tensor:
+        raise ValueError("Spike tensor must be non-empty")
+    T = len(spike_tensor)
+    height = len(spike_tensor[0]) if T else 0
+    width = len(spike_tensor[0][0]) if height else 0
+    if height == 0 or width == 0:
+        raise ValueError("Spike tensor must have positive spatial dimensions")
+    total_spikes = 0
+    duty_cycle: List[float] = []
+    pixels = height * width
+    for frame in spike_tensor:
+        if len(frame) != height:
+            raise ValueError("Inconsistent frame height in spike tensor")
+        frame_spikes = 0
+        for row in frame:
+            if len(row) != width:
+                raise ValueError("Inconsistent frame width in spike tensor")
+            frame_spikes += sum(row)
+        total_spikes += frame_spikes
+        duty_cycle.append(frame_spikes / max(1, pixels))
+    per_pixel = total_spikes / max(1, pixels)
+    return {
+        "total": total_spikes,
+        "per_pixel": per_pixel,
+        "duty_cycle": duty_cycle,
+    }
+
+
 @dataclass
 class ExampleRecord:
     path: Path
@@ -115,6 +144,13 @@ class ExampleRecord:
     ascii_art: str
     alignment_ref: str
     alignment_hyp: str
+    energy_total: int = 0
+    energy_per_pixel: float = 0.0
+    duty_cycle: List[float] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.duty_cycle is None:
+            self.duty_cycle = []
 
 
 @dataclass
@@ -125,6 +161,9 @@ class EvalMetrics:
     avg_fire_rate: float
     avg_width: float
     samples: int
+    energy_total: float
+    energy_per_pixel: float
+    duty_cycle: List[float]
 
 
 def dump_examples(examples: Sequence[ExampleRecord], out_dir: Path) -> None:
@@ -141,15 +180,24 @@ def dump_examples(examples: Sequence[ExampleRecord], out_dir: Path) -> None:
             handle.write(record.alignment_hyp + "\n")
             handle.write("ASCII preview:\n")
             handle.write(record.ascii_art + "\n")
+            handle.write(
+                "Energy: total={:.0f}, per_pixel={:.3f}, duty={}\n".format(
+                    record.energy_total,
+                    record.energy_per_pixel,
+                    ",".join(f"{value:.3f}" for value in record.duty_cycle),
+                )
+            )
 
 
-def load_checkpoint(path: Path) -> SequenceLinear:
+def load_checkpoint(path: Path) -> CurriculumModel:
+    model = CurriculumModel(feature_dim=5, output_dim=len(SYMBOLS), seed=11)
     if not path.exists():
-        return SequenceLinear(feature_dim=5, output_dim=len(SYMBOLS), seed=11)
+        return model
     with path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
-    model = SequenceLinear(feature_dim=5, output_dim=len(SYMBOLS), seed=11)
-    model.load_state_dict(payload["model"])
+    state = payload.get("model")
+    if isinstance(state, dict):
+        model.load_state_dict(state)
     return model
 
 
@@ -205,7 +253,9 @@ def evaluate(
     total_word_err = 0
     total_fire = 0.0
     total_width = 0.0
-    rng = Random(0)
+    energy_total_sum = 0.0
+    energy_per_pixel_sum = 0.0
+    duty_cycle_sum: List[float] | None = None
     showcase: List[ExampleRecord] = []
     for entry in entries:
         image = entry["image"]  # type: ignore[index]
@@ -229,7 +279,17 @@ def evaluate(
         total_words += max(1, len(text.split()))
         total_fire += compute_fire_rate(image)
         total_width += len(sequence)
-        if len(showcase) < sample_count and rng.random() < 0.6:
+        spike_tensor = spikes.encode_ttfs(image, T=ENERGY_TIMESTEPS)
+        energy = energy_stats(spike_tensor)
+        energy_total_sum += float(energy["total"])
+        energy_per_pixel_sum += float(energy["per_pixel"])
+        duty = energy["duty_cycle"]  # type: ignore[assignment]
+        if isinstance(duty_cycle_sum, list):
+            for idx, value in enumerate(duty):
+                duty_cycle_sum[idx] += value
+        else:
+            duty_cycle_sum = [float(value) for value in duty]
+        if len(showcase) < sample_count:
             aligned_ref, aligned_hyp = align_strings(text, prediction)
             ascii_art = render.ascii_preview(image)
             rec = ExampleRecord(
@@ -241,6 +301,9 @@ def evaluate(
                 ascii_art=ascii_art,
                 alignment_ref=aligned_ref,
                 alignment_hyp=aligned_hyp,
+                energy_total=int(energy["total"]),
+                energy_per_pixel=float(energy["per_pixel"]),
+                duty_cycle=[float(value) for value in duty],
             )
             showcase.append(rec)
     metrics = EvalMetrics(
@@ -250,6 +313,9 @@ def evaluate(
         avg_fire_rate=total_fire / total,
         avg_width=total_width / total,
         samples=total,
+        energy_total=energy_total_sum / total,
+        energy_per_pixel=energy_per_pixel_sum / total,
+        duty_cycle=[value / total for value in duty_cycle_sum] if duty_cycle_sum else [],
     )
     return metrics, showcase
 
@@ -285,7 +351,8 @@ def run_demo() -> None:
     print(
         f"Demo metrics ({stage}): top1={metrics.top1:.2f}, "
         f"CER={metrics.cer:.3f}, WER={metrics.wer:.3f}, "
-        f"fire={metrics.avg_fire_rate:.3f}, W'={metrics.avg_width:.2f}"
+        f"fire={metrics.avg_fire_rate:.3f}, W'={metrics.avg_width:.2f}, "
+        f"energy={metrics.energy_total:.1f}, duty={','.join(f'{v:.3f}' for v in metrics.duty_cycle)}"
     )
 
 
@@ -313,10 +380,29 @@ def main() -> None:
                 "fire_rate": metrics.avg_fire_rate,
                 "width_out": metrics.avg_width,
                 "samples": metrics.samples,
+                "energy_total": metrics.energy_total,
+                "energy_per_pixel": metrics.energy_per_pixel,
+                "duty_cycle": metrics.duty_cycle,
             }
         )
     )
 
 
+def preview_examples(count: int = 3) -> None:
+    stage = "S3"
+    data_dir = Path("runs") / "preview_eval_s3"
+    ensure_dataset(stage, data_dir, size=20)
+    metrics, examples = evaluate(stage, data_dir, checkpoint=None, limit=20, sample_count=count)
+    vis_dir = Path("runs") / "vis" / f"{stage.lower()}_preview"
+    dump_examples(examples[:count], vis_dir)
+    print(
+        f"Preview ({stage}): saved {min(len(examples), count)} samples to {vis_dir}, "
+        f"avg energy={metrics.energy_total:.1f} spikes"
+    )
+
+
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 1:
+        preview_examples()
+    else:
+        main()
