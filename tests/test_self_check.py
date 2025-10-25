@@ -18,7 +18,7 @@ class SelfCheckSmokeTest(unittest.TestCase):
             text=True,
             check=True,
         )
-        self.assertIn("第三方依赖扫描：0 条", result.stdout)
+        self.assertIn("非标准库依赖 0 条", result.stdout)
 
 
 if __name__ == "__main__":
