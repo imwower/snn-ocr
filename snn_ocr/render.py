@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from random import Random
-from typing import List
+from typing import List, Sequence
 
 from snn_ocr import bitfont, pgm
 
@@ -28,23 +28,40 @@ def render_text(
     jitter: int = 1,
     noise: float = 0.01,
     contrast: float = 1.0,
+    scale: int | None = None,
+    shear: int = 0,
+    dilate: int = 0,
+    foreground: int = 255,
+    background: int = 0,
+    seed: int | None = None,
 ) -> GrayGrid:
     """Render a single text row into a grayscale canvas of shape (h, w)."""
     if w <= 0 or h <= 0:
         raise ValueError("Target dimensions must be positive")
     if not text:
-        return [[0 for _ in range(w)] for _ in range(h)]
+        return [[background for _ in range(w)] for _ in range(h)]
+    bitfont.validate_charset(font, required=text)
     base = bitfont.render_text_row(text, size=font)
     base_h = len(base)
     base_w = len(base[0])
     if base_h > h or base_w > w:
         raise ValueError("Target canvas too small for requested text")
-    scale = max(1, min(w // base_w, h // base_h))
-    scaled = bitfont.scale_nn(base, scale, scale) if scale > 1 else [row.copy() for row in base]
+    if scale is None:
+        auto_scale = max(1, min(w // base_w, h // base_h))
+    else:
+        auto_scale = max(1, scale)
+    scaled = bitfont.scale_nn(base, auto_scale, auto_scale)
+    if shear:
+        scaled = bitfont.shear_x(scaled, shear)
+    if dilate > 0:
+        scaled = bitfont.dilate3x3(scaled, n=dilate)
     scaled_h = len(scaled)
     scaled_w = len(scaled[0])
-    canvas: GrayGrid = [[0 for _ in range(w)] for _ in range(h)]
-    rng = _deterministic_rng(text, w, h)
+    if scaled_h > h or scaled_w > w:
+        raise ValueError("Transformed glyph exceeds target canvas; increase w/h or reduce transforms")
+    glyph_gray = bitfont.to_gray(scaled, fg=foreground, bg=background)
+    canvas: GrayGrid = [[background for _ in range(w)] for _ in range(h)]
+    rng = _deterministic_rng(text if seed is None else f"{text}:{seed}", w, h)
     jitter = max(0, jitter)
     shift_x = rng.randint(-jitter, jitter) if jitter else 0
     shift_y = rng.randint(-jitter, jitter) if jitter else 0
@@ -52,21 +69,23 @@ def render_text(
     origin_y = max(0, min((h - scaled_h) // 2 + shift_y, h - scaled_h))
     for y in range(scaled_h):
         canvas_row = canvas[origin_y + y]
-        glyph_row = scaled[y]
+        glyph_row = glyph_gray[y]
         for x in range(scaled_w):
-            if glyph_row[x]:
-                canvas_row[origin_x + x] = 255
+            value = glyph_row[x]
+            if value != background:
+                canvas_row[origin_x + x] = value
     if noise > 0:
-        noise = max(0.0, min(1.0, noise))
+        amplitude = int(255 * min(1.0, max(0.0, noise)))
         for y in range(h):
+            row = canvas[y]
             for x in range(w):
-                if rng.random() < noise:
-                    canvas[y][x] = 255 if rng.random() < 0.5 else 0
+                delta = rng.randint(-amplitude, amplitude)
+                row[x] = _clamp(row[x] + delta)
     if contrast != 1.0:
         for y in range(h):
             row = canvas[y]
             for x in range(w):
-                row[x] = _clamp((row[x] - 128) * contrast + 128)
+                row[x] = _clamp(background + (row[x] - background) * contrast)
     assert len(canvas) == h
     assert all(len(row) == w for row in canvas)
     return canvas
@@ -74,7 +93,23 @@ def render_text(
 
 def ascii_preview(gray: GrayGrid) -> str:
     """Return an ASCII representation of a grayscale grid."""
-    return "\n".join("".join("#" if value > 128 else "." for value in row) for row in gray)
+    if not gray:
+        return ""
+    gradient = " .:-=+*#%@"
+    v_min = min(min(row) for row in gray)
+    v_max = max(max(row) for row in gray)
+    if v_max == v_min:
+        return "\n".join(gradient[-1] * len(row) for row in gray)
+    span = v_max - v_min
+    lines: List[str] = []
+    for row in gray:
+        line_chars = []
+        for value in row:
+            norm = (value - v_min) / span
+            idx = min(len(gradient) - 1, max(0, int(round(norm * (len(gradient) - 1)))))
+            line_chars.append(gradient[idx])
+        lines.append("".join(line_chars))
+    return "\n".join(lines)
 
 
 def _self_check() -> None:
@@ -85,7 +120,18 @@ def _self_check() -> None:
 
 if __name__ == "__main__":
     _self_check()
-    canvas = render_text("HELLO", 128, 32, jitter=1, noise=0.02, contrast=1.2)
+    canvas = render_text(
+        "HELLO",
+        160,
+        48,
+        jitter=1,
+        noise=0.03,
+        contrast=1.15,
+        scale=2,
+        shear=1,
+        dilate=1,
+        background=24,
+    )
     out_path = Path("hello.pgm")
     pgm.save_pgm(out_path, canvas)
     print(f"Saved {out_path.resolve()}")

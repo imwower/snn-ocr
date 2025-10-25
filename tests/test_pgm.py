@@ -46,8 +46,17 @@ class PgmIoTest(unittest.TestCase):
 
     def test_invalid_gray_value_raises(self) -> None:
         gray = [[-1]]
-        with self.assertRaises(ValueError):
-            pgm.save_pgm(Path("ignored.pgm"), gray)
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "invalid.pgm"
+            with self.assertRaises(ValueError):
+                pgm.save_pgm(path, gray)
+
+    def test_invalid_header_raises(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "broken.pgm"
+            path.write_bytes(b"P9\n1 1\n255\n\x00")
+            with self.assertRaises(ValueError):
+                pgm.load_pgm(path)
 
 
 if __name__ == "__main__":

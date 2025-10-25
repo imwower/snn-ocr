@@ -8,8 +8,10 @@ GridGray = List[List[int]]
 PixelRGB = Tuple[int, int, int]
 GridRGB = List[List[PixelRGB]]
 
+_WHITESPACE = b" \t\r\n"
 
-def _validate_gray(grid: GridGray) -> None:
+
+def _validate_gray(grid: GridGray) -> Tuple[int, int]:
     if not grid or not grid[0]:
         raise ValueError("Gray grid must be non-empty")
     width = len(grid[0])
@@ -19,9 +21,10 @@ def _validate_gray(grid: GridGray) -> None:
         for value in row:
             if not 0 <= value <= 255:
                 raise ValueError("Gray values must lie in 0..255")
+    return len(grid), width
 
 
-def _validate_rgb(grid: GridRGB) -> None:
+def _validate_rgb(grid: GridRGB) -> Tuple[int, int]:
     if not grid or not grid[0]:
         raise ValueError("RGB grid must be non-empty")
     width = len(grid[0])
@@ -31,68 +34,74 @@ def _validate_rgb(grid: GridRGB) -> None:
         for r, g, b in row:
             if not (0 <= r <= 255 and 0 <= g <= 255 and 0 <= b <= 255):
                 raise ValueError("RGB channel values must lie in 0..255")
+    return len(grid), width
+
+
+def _write_header(handle, magic: str, width: int, height: int) -> None:
+    handle.write(f"{magic}\n{width} {height}\n255\n".encode("ascii"))
 
 
 def save_pgm(path: Path, gray: GridGray) -> None:
     """Write a P5 binary PGM image to disk."""
-    _validate_gray(gray)
-    height = len(gray)
-    width = len(gray[0])
-    header = f"P5\n{width} {height}\n255\n".encode("ascii")
-    body = bytearray(value for row in gray for value in row)
-    Path(path).write_bytes(header + body)
+    height, width = _validate_gray(gray)
+    target = Path(path)
+    with target.open("wb") as handle:
+        _write_header(handle, "P5", width, height)
+        for row in gray:
+            handle.write(bytes(row))
 
 
 def save_ppm(path: Path, rgb: GridRGB) -> None:
     """Write a P6 binary PPM image to disk."""
-    _validate_rgb(rgb)
-    height = len(rgb)
-    width = len(rgb[0])
-    header = f"P6\n{width} {height}\n255\n".encode("ascii")
-    body = bytearray(component for row in rgb for pixel in row for component in pixel)
-    Path(path).write_bytes(header + body)
+    height, width = _validate_rgb(rgb)
+    target = Path(path)
+    with target.open("wb") as handle:
+        _write_header(handle, "P6", width, height)
+        for row in rgb:
+            handle.write(bytes(component for pixel in row for component in pixel))
 
 
-def _parse_header(buffer: bytes) -> Tuple[str, int, int, int, int]:
-    """Return (magic, width, height, maxval, offset) for Netpbm data."""
-    if len(buffer) < 11:
-        raise ValueError("Buffer too small to be a Netpbm image")
-    magic = buffer[:2]
-    if magic not in (b"P5", b"P6"):
-        raise ValueError("Unsupported Netpbm magic number")
-    tokens: List[str] = []
-    idx = 2
-    current = bytearray()
-    while idx < len(buffer) and len(tokens) < 3:
-        byte = buffer[idx]
-        if byte == 35:  # Comment start '#'
-            while idx < len(buffer) and buffer[idx] not in (10, 13):
-                idx += 1
-        elif byte in (9, 10, 13, 32):
-            if current:
-                tokens.append(current.decode("ascii"))
-                current.clear()
-        else:
-            current.append(byte)
-        idx += 1
-    if current:
-        tokens.append(current.decode("ascii"))
-    if len(tokens) < 3:
-        raise ValueError("Incomplete Netpbm header")
-    width, height, maxval = map(int, tokens[:3])
-    if maxval != 255:
-        raise ValueError("Only maxval=255 images are supported")
-    return magic.decode("ascii"), width, height, maxval, idx
+def _read_token(handle) -> str:
+    token = bytearray()
+    while True:
+        ch = handle.read(1)
+        if not ch:
+            if token:
+                return token.decode("ascii")
+            raise ValueError("Unexpected EOF while reading Netpbm header")
+        if ch == b"#":
+            handle.readline()
+            continue
+        if ch in _WHITESPACE:
+            if token:
+                return token.decode("ascii")
+            continue
+        token.append(ch[0])
+
+
+def _read_header(path: Path) -> Tuple[str, int, int, int, int]:
+    with Path(path).open("rb") as handle:
+        magic = _read_token(handle)
+        if magic not in ("P5", "P6"):
+            raise ValueError("Unsupported Netpbm format")
+        width = int(_read_token(handle))
+        height = int(_read_token(handle))
+        maxval = int(_read_token(handle))
+        if maxval != 255:
+            raise ValueError("Only maxval=255 Netpbm images are supported")
+        data_offset = handle.tell()
+    return magic, width, height, maxval, data_offset
 
 
 def load_pgm(path: Path) -> GridGray:
     """Load a P5 binary PGM image into a 2D grayscale grid."""
-    raw = Path(path).read_bytes()
-    magic, width, height, _, offset = _parse_header(raw)
+    target = Path(path)
+    magic, width, height, _, data_offset = _read_header(target)
     if magic != "P5":
         raise ValueError("Expected P5 magic for PGM image")
-    payload = raw[offset:]
     expected = width * height
+    raw = target.read_bytes()
+    payload = raw[data_offset:]
     if len(payload) != expected:
         raise ValueError("Unexpected payload length for PGM image")
     grid: GridGray = []

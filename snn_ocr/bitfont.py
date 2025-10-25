@@ -657,6 +657,25 @@ FONTS: Mapping[str, Mapping[str, Tuple[Tuple[int, ...], ...]]] = MappingProxyTyp
     {"5x7": FONT_5X7, "7x9": FONT_7X9}
 )
 
+REQUIRED_CHARSET: Tuple[str, ...] = tuple(
+    "0123456789"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "abcdefghijklmnopqrstuvwxyz"
+    " .,!?"
+)
+
+
+def validate_charset(size: str = "5x7", required: Sequence[str] | None = None) -> bool:
+    """Ensure the requested font size contains every glyph in the required set."""
+    font = FONTS.get(size)
+    if font is None:
+        raise KeyError(f"Unsupported size {size!r}")
+    required_chars = REQUIRED_CHARSET if required is None else tuple(required)
+    missing = [ch for ch in required_chars if ch not in font]
+    if missing:
+        raise KeyError(f"Font {size} missing glyphs: {''.join(missing)}")
+    return True
+
 
 def get_bitmap(ch: str, size: str = "5x7") -> Grid:
     """Return a copy of the bitmap for a single character."""

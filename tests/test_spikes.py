@@ -43,7 +43,21 @@ class SpikeEncodingTest(unittest.TestCase):
         self.assertEqual(len(on[0][0]), len(gray[0]))
         on_total = sum(sum(sum(row) for row in frame) for frame in on)
         off_total = sum(sum(sum(row) for row in frame) for frame in off)
-        self.assertEqual(on_total, off_total)
+        self.assertGreater(on_total, 0)
+        self.assertEqual(off_total, on_total)
+
+    def test_micro_saccade_shift(self) -> None:
+        gray = [
+            [0, 255],
+            [0, 0],
+        ]
+        tensor = spikes.encode_ttfs(gray, T=2)
+        shifted = spikes.apply_micro_saccade(tensor, dx=-1, dy=0)
+        original_counts = [sum(sum(row) for row in frame) for frame in tensor]
+        shifted_counts = [sum(sum(row) for row in frame) for frame in shifted]
+        self.assertEqual(original_counts, shifted_counts)
+        # Ensure spike moved left into column 0
+        self.assertEqual(shifted[0][0][0], 1)
 
 
 if __name__ == "__main__":

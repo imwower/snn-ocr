@@ -23,10 +23,28 @@ class RenderTest(unittest.TestCase):
         noisy_values = sum(cell for row in noisy for cell in row)
         self.assertNotEqual(clean_values, noisy_values)
 
+    def test_transforms_and_background(self) -> None:
+        canvas = render.render_text(
+            "OK",
+            96,
+            32,
+            scale=2,
+            shear=2,
+            dilate=1,
+            background=32,
+            foreground=220,
+            jitter=0,
+            noise=0.0,
+        )
+        self.assertEqual(len(canvas), 32)
+        self.assertTrue(all(len(row) == 96 for row in canvas))
+        minimum = min(min(row) for row in canvas)
+        self.assertEqual(minimum, 32)
+
     def test_ascii_preview(self) -> None:
         canvas = [[0, 255], [255, 0]]
         preview = render.ascii_preview(canvas)
-        self.assertEqual(preview, ".#\n#.")
+        self.assertEqual(preview, " @\n@ ")
 
 
 if __name__ == "__main__":

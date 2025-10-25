@@ -49,6 +49,11 @@ class BitfontTest(unittest.TestCase):
         unique_values = {pixel for row in grayscale for pixel in row}
         self.assertSetEqual(unique_values, {10, 200})
 
+    def test_validate_charset(self) -> None:
+        self.assertTrue(bitfont.validate_charset("5x7"))
+        with self.assertRaises(KeyError):
+            bitfont.validate_charset("5x7", required=("~",))
+
 
 if __name__ == "__main__":
     unittest.main()
