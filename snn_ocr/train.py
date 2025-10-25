@@ -927,6 +927,7 @@ class TrainArgs:
     distill: bool
     distill_lambda: float
     teacher_ckpt: Path | None
+    distill_temp: float
     dev_steps: int
     dev_batch: int
     dev_every: int
@@ -987,6 +988,7 @@ def run_epoch(
     rng: Random,
     teacher_model: CurriculumModel | None,
     kd_lambda: float,
+    kd_temperature: float,
 ) -> Tuple[int, float | None, float | None, Dict[str, object] | None]:
     first_loss: float | None = None
     last_loss: float | None = None
@@ -1024,6 +1026,7 @@ def run_epoch(
                 STAGE_CONFIGS[sample.stage],
                 teacher_logits=teacher_logits,
                 distill_lambda=kd_lambda if apply_kd else 0.0,
+                kd_temperature=kd_temperature,
             )
             grad_params = model.backward(breakdown.grad_logits)
             add_grad(grad_accum, grad_params)
@@ -1258,6 +1261,7 @@ def train_stage(args: TrainArgs) -> TrainingResult:
                 rng=rng,
                 teacher_model=teacher_model,
                 kd_lambda=args.distill_lambda if teacher_model is not None else 0.0,
+                kd_temperature=args.distill_temp,
             )
             if result.initial_loss is None and first_loss is not None:
                 result.initial_loss = first_loss
@@ -1499,6 +1503,7 @@ def parse_args() -> argparse.Namespace:
         default=0.3,
         help="Weight for the KD term when --distill is active.",
     )
+    parser.add_argument("--distill-temp", type=float, default=KD_TEMPERATURE, help="Distillation temperature tau.")
     parser.add_argument("--teacher", type=Path, default=None, help="Optional explicit teacher checkpoint.")
     parser.add_argument("--demo", action="store_true", help="Run a short S1 demo.")
     return parser.parse_args()
@@ -1527,6 +1532,7 @@ def run_demo() -> None:
         distill=False,
         distill_lambda=0.0,
         teacher_ckpt=None,
+        distill_temp=KD_TEMPERATURE,
         dev_steps=0,
         dev_batch=8,
         dev_every=1,
@@ -1568,6 +1574,7 @@ def main() -> None:
         distill=args_ns.distill,
         distill_lambda=args_ns.distill_lambda,
         teacher_ckpt=args_ns.teacher,
+        distill_temp=args_ns.distill_temp,
         dev_steps=args_ns.dev_steps,
         dev_batch=args_ns.dev_batch,
         dev_every=args_ns.dev_every,

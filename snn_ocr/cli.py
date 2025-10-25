@@ -45,6 +45,7 @@ def cmd_train(ns: argparse.Namespace) -> None:
         distill=ns.distill,
         distill_lambda=ns.distill_lambda,
         teacher_ckpt=Path(ns.teacher) if ns.teacher else None,
+        distill_temp=ns.distill_temp,
         dev_steps=ns.dev_steps,
         dev_batch=ns.dev_batch,
         dev_every=ns.dev_every,
@@ -174,6 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional explicit checkpoint path to use as the distillation teacher.",
     )
+    parser_train.add_argument("--distill-temp", type=float, default=1.5)
     parser_train.set_defaults(func=cmd_train)
 
     parser_eval = subparsers.add_parser("eval", help="Evaluate a checkpoint.")
