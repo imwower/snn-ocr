@@ -16,8 +16,11 @@ def cmd_synth(ns: argparse.Namespace) -> None:
     out_dir = Path(ns.out)
     ensure_dir(out_dir)
     with Timer(f"Generating {ns.n} samples for {stage}"):
-        synth.generate_dataset(stage, ns.n, out_dir)
-    print(json.dumps({"stage": stage, "samples": ns.n, "out": str(out_dir)}))
+        summary = synth.generate_dataset(stage, ns.n, out_dir, profile=ns.profile)
+    payload = {"stage": stage, "samples": ns.n, "out": str(out_dir)}
+    if ns.profile:
+        payload["profile"] = summary
+    print(json.dumps(payload, ensure_ascii=False))
 
 
 def cmd_train(ns: argparse.Namespace) -> None:
@@ -127,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser_synth.add_argument("--stage", type=str, default="S1")
     parser_synth.add_argument("--n", type=int, required=True)
     parser_synth.add_argument("--out", type=str, required=True)
+    parser_synth.add_argument("--profile", action="store_true", help="Print dataset profile summary.")
     parser_synth.set_defaults(func=cmd_synth)
 
     parser_train = subparsers.add_parser("train", help="Train a stage model.")

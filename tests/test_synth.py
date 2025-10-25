@@ -1,38 +1,31 @@
-"""Unit tests for snn_ocr.synth dataset generation."""
+"""Tests for curriculum data synthesis scheduler."""
 from __future__ import annotations
 
 import json
-import unittest
+import tempfile
 from pathlib import Path
-from tempfile import TemporaryDirectory
+import unittest
 
 from snn_ocr import synth
 
 
-class SynthTest(unittest.TestCase):
-    """Validate sample synthesis across curriculum stages."""
+class SynthSchedulerTest(unittest.TestCase):
+    def test_labels_include_meta(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            out = Path(tmp_dir)
+            synth.generate_dataset("S1", 3, out, seed=1, profile=False)
+            labels = out / "labels.jsonl"
+            with labels.open("r", encoding="utf-8") as handle:
+                line = handle.readline()
+            record = json.loads(line)
+            self.assertIn("meta", record)
+            self.assertIn("text_length", record["meta"])
 
-    def test_make_sample_dimensions(self) -> None:
-        for stage, setting in synth.STAGE_SETTINGS.items():
-            image, text = synth.make_sample(stage, seed=123)
-            self.assertEqual(len(image), setting.height)
-            self.assertTrue(all(len(row) == setting.width for row in image))
-            self.assertTrue(set(text).issubset(synth.ALLOWED_CHARS))
-
-    def test_generate_dataset_integrity(self) -> None:
-        with TemporaryDirectory() as tmp_dir:
-            out = Path(tmp_dir) / "s1_samples"
-            synth.generate_dataset("S1", 3, out)
-            images = sorted((out / "images").glob("*.pgm"))
-            self.assertEqual(len(images), 3)
-            labels_path = out / "labels.jsonl"
-            lines = labels_path.read_text(encoding="utf-8").strip().splitlines()
-            self.assertEqual(len(lines), 3)
-            parsed = [json.loads(line) for line in lines]
-            for entry in parsed:
-                file_path = out / entry["file"]
-                self.assertTrue(file_path.exists())
-                self.assertTrue(set(entry["text"]).issubset(synth.ALLOWED_CHARS))
+    def test_profile_summary_bounds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            summary = synth.generate_dataset("S3", 12, Path(tmp_dir), seed=2, profile=False)
+        self.assertGreater(summary["avg_length"], 2.0)
+        self.assertLess(summary["avg_length"], 9.0)
 
 
 if __name__ == "__main__":

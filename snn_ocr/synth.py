@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from random import Random
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -41,6 +42,63 @@ class StageSetting:
     punctuation_prob: float = 0.0
     allow_newline: bool = False
     newline_prob: float = 0.0
+
+
+@dataclass
+class SampleMeta:
+    progress: float
+    text_length: int
+    word_count: int | None
+    contrast: float
+    noise: float
+    scale: int
+    shear: int
+    dilate: int
+    background: int
+    foreground: int
+    jitter: int
+
+
+@dataclass
+class StageProfile:
+    stage: str
+    lengths: List[int] = field(default_factory=list)
+    word_counts: List[int] = field(default_factory=list)
+    contrasts: List[float] = field(default_factory=list)
+    noises: List[float] = field(default_factory=list)
+
+    def update(self, meta: SampleMeta) -> None:
+        self.lengths.append(meta.text_length)
+        if meta.word_count is not None:
+            self.word_counts.append(meta.word_count)
+        self.contrasts.append(meta.contrast)
+        self.noises.append(meta.noise)
+
+    def summary(self) -> Dict[str, object]:
+        def _avg(values: List[float]) -> float:
+            return sum(values) / len(values) if values else 0.0
+
+        length_hist = dict(sorted(Counter(self.lengths).items())) if self.lengths else {}
+        word_hist = dict(sorted(Counter(self.word_counts).items())) if self.word_counts else {}
+
+        return {
+            "stage": self.stage,
+            "count": len(self.lengths),
+            "avg_length": _avg([float(x) for x in self.lengths]),
+            "min_length": min(self.lengths) if self.lengths else 0,
+            "max_length": max(self.lengths) if self.lengths else 0,
+            "avg_word_count": _avg([float(x) for x in self.word_counts]) if self.word_counts else None,
+            "contrast_range": (
+                min(self.contrasts) if self.contrasts else 0.0,
+                max(self.contrasts) if self.contrasts else 0.0,
+            ),
+            "noise_range": (
+                min(self.noises) if self.noises else 0.0,
+                max(self.noises) if self.noises else 0.0,
+            ),
+            "length_histogram": length_hist,
+            "word_count_histogram": word_hist if word_hist else None,
+        }
 
 
 STAGE_SETTINGS: Dict[str, StageSetting] = {
@@ -130,27 +188,50 @@ def _random_word(rng: Random, length: int, pool: str) -> str:
     return "".join(rng.choice(pool) for _ in range(length))
 
 
-def _sample_text(stage: str, setting: StageSetting, rng: Random) -> str:
+def _weighted_choice(rng: Random, progress: float, strength: float = 0.7) -> float:
+    progress = max(0.0, min(1.0, progress))
+    return (1.0 - strength) * rng.random() + strength * progress
+
+
+def _progressive_int(bounds: Tuple[int, int], rng: Random, progress: float) -> int:
+    low, high = bounds
+    if low == high:
+        return low
+    if low > high:
+        low, high = high, low
+    mix = _weighted_choice(rng, progress)
+    value = low + (high - low) * mix
+    return int(round(value))
+
+
+def _sample_text(
+    stage: str,
+    setting: StageSetting,
+    rng: Random,
+    *,
+    target_len: int | None = None,
+    word_target: int | None = None,
+) -> Tuple[str, Dict[str, int | None]]:
     mode = setting.mode
     if mode in ("digit", "char"):
-        length = _rand_int(rng, (setting.min_len, setting.max_len))
+        length = target_len if target_len is not None else _rand_int(rng, (setting.min_len, setting.max_len))
         token = "".join(rng.choice(setting.char_pool) for _ in range(length))
         if mode == "char" and rng.random() < 0.3:
             token = token.upper()
-        return token
+        return token, {"word_count": None, "length_target": length}
     if mode == "word":
-        length = _rand_int(rng, (setting.min_len, setting.max_len))
+        length = target_len if target_len is not None else _rand_int(rng, (setting.min_len, setting.max_len))
         word = _random_word(rng, length, setting.char_pool)
         if rng.random() < 0.4:
             word = word.upper()
-        return word
+        return word, {"word_count": 1, "length_target": length}
     if mode == "sentence":
         if not setting.word_count:
             raise ValueError("Sentence mode requires word_count range")
-        count = _rand_int(rng, setting.word_count)
+        count = word_target if word_target is not None else _rand_int(rng, setting.word_count)
         words: List[str] = []
         for _ in range(count):
-            length = _rand_int(rng, (setting.min_len, setting.max_len))
+            length = target_len if target_len is not None else _rand_int(rng, (setting.min_len, setting.max_len))
             word = _random_word(rng, length, setting.char_pool)
             if rng.random() < 0.2:
                 word = word.upper()
@@ -177,7 +258,7 @@ def _sample_text(stage: str, setting: StageSetting, rng: Random) -> str:
         if setting.punctuation and rng.random() < setting.punctuation_prob:
             sentence = sentence.rstrip(" ")
             sentence += rng.choice(setting.punctuation)
-        return sentence
+        return sentence, {"word_count": count, "length_target": length}
     raise KeyError(f"Unsupported stage mode {mode!r}")
 
 
@@ -186,21 +267,57 @@ def _assert_valid_chars(text: str) -> None:
         raise ValueError(f"Text contains unsupported characters: {text}")
 
 
-def make_sample(stage: str, seed: int) -> Tuple[GrayGrid, str]:
+def _schedule_parameters(setting: StageSetting, rng: Random, progress: float) -> Dict[str, object]:
+    contrast = setting.contrast * (0.9 + 0.2 * _weighted_choice(rng, progress, strength=0.5))
+    noise_base = setting.noise
+    noise = noise_base * (0.5 + 0.5 * _weighted_choice(rng, progress, strength=0.6)) if noise_base > 0 else 0.0
+    scale = max(1, _progressive_int(setting.scale_range, rng, progress))
+    shear = _progressive_int(setting.shear_range, rng, progress)
+    dilate = max(0, _progressive_int(setting.dilate_range, rng, progress))
+    background = _rand_int(rng, setting.background_range)
+    foreground = max(background + 1, _rand_int(rng, setting.foreground_range))
+    length_target = None
+    word_target = None
+    if setting.mode in ("digit", "char", "word"):
+        length_target = _progressive_int((setting.min_len, setting.max_len), rng, progress)
+    if setting.mode == "sentence" and setting.word_count:
+        word_target = _progressive_int(setting.word_count, rng, progress)
+        length_target = _progressive_int((setting.min_len, setting.max_len), rng, progress)
+    return {
+        "contrast": contrast,
+        "noise": noise,
+        "scale": scale,
+        "shear": shear,
+        "dilate": dilate,
+        "background": background,
+        "foreground": foreground,
+        "length_target": length_target,
+        "word_target": word_target,
+    }
+
+
+def make_sample(stage: str, seed: int, progress: float = 0.0) -> Tuple[GrayGrid, str, SampleMeta]:
     """Return a single (image, text) sample for the requested stage."""
     stage = stage.upper()
     if stage not in STAGE_SETTINGS:
         raise KeyError(f"Unknown stage {stage}")
     setting = STAGE_SETTINGS[stage]
     rng = Random((hash(stage) ^ seed) & 0xFFFFFFFF)
-    text = _sample_text(stage, setting, rng)
+    params = _schedule_parameters(setting, rng, progress)
+    text, length_info = _sample_text(
+        stage,
+        setting,
+        rng,
+        target_len=params["length_target"],
+        word_target=params["word_target"],
+    )
     _assert_valid_chars(text)
     render_seed = rng.randint(0, 2**31 - 1)
-    scale = _rand_int(rng, setting.scale_range)
-    shear = _rand_int(rng, setting.shear_range)
-    dilate = max(0, _rand_int(rng, setting.dilate_range))
-    background = _rand_int(rng, setting.background_range)
-    foreground = max(background + 1, _rand_int(rng, setting.foreground_range))
+    scale = params["scale"]
+    shear = params["shear"]
+    dilate = params["dilate"]
+    background = params["background"]
+    foreground = params["foreground"]
     gray = _render_with_retries(
         text,
         setting,
@@ -209,9 +326,25 @@ def make_sample(stage: str, seed: int) -> Tuple[GrayGrid, str]:
         dilate=dilate,
         background=background,
         foreground=foreground,
+        contrast=params["contrast"],
+        noise=params["noise"],
         seed=render_seed,
     )
-    return gray, text
+    word_count_meta = length_info.get("word_count")
+    meta = SampleMeta(
+        progress=progress,
+        text_length=len(text.replace("\n", "")),
+        word_count=word_count_meta,
+        contrast=params["contrast"],
+        noise=params["noise"],
+        scale=scale,
+        shear=shear,
+        dilate=dilate,
+        background=background,
+        foreground=foreground,
+        jitter=setting.jitter,
+    )
+    return gray, text, meta
 
 
 def _render_with_retries(
@@ -223,6 +356,8 @@ def _render_with_retries(
     dilate: int,
     background: int,
     foreground: int,
+    contrast: float,
+    noise: float,
     seed: int,
 ) -> GrayGrid:
     attempts = [
@@ -238,8 +373,8 @@ def _render_with_retries(
                 setting.height,
                 font=setting.font,
                 jitter=setting.jitter,
-                noise=setting.noise,
-                contrast=setting.contrast,
+                noise=noise,
+                contrast=contrast,
                 scale=max(1, sc),
                 shear=sh,
                 dilate=max(0, di),
@@ -256,8 +391,8 @@ def _render_with_retries(
         setting.height,
         font=setting.font,
         jitter=0,
-        noise=setting.noise,
-        contrast=setting.contrast,
+        noise=noise,
+        contrast=contrast,
         scale=1,
         shear=0,
         dilate=0,
@@ -267,7 +402,14 @@ def _render_with_retries(
     )
 
 
-def generate_dataset(stage: str, n: int, out_dir: Path, seed: int = 0) -> None:
+def generate_dataset(
+    stage: str,
+    n: int,
+    out_dir: Path,
+    seed: int = 0,
+    *,
+    profile: bool = False,
+) -> Dict[str, object]:
     """Generate a dataset with images/ and labels.jsonl for the given stage."""
     if n <= 0:
         raise ValueError("n must be positive")
@@ -279,10 +421,12 @@ def generate_dataset(stage: str, n: int, out_dir: Path, seed: int = 0) -> None:
     images_dir.mkdir(parents=True, exist_ok=True)
     labels_path = out_dir / "labels.jsonl"
     master_rng = Random(seed)
+    profiler = StageProfile(stage=stage)
     with labels_path.open("w", encoding="utf-8") as labels_file:
         for index in range(n):
             sample_seed = master_rng.randint(0, 2**31 - 1)
-            gray, text = make_sample(stage, seed=sample_seed)
+            progress = index / max(1, n - 1)
+            gray, text, meta = make_sample(stage, seed=sample_seed, progress=progress)
             filename = f"{index + 1:05d}.pgm"
             pgm_path = images_dir / filename
             pgm.save_pgm(pgm_path, gray)
@@ -291,9 +435,26 @@ def generate_dataset(stage: str, n: int, out_dir: Path, seed: int = 0) -> None:
                 "text": text,
                 "stage": stage,
                 "seed": sample_seed,
+                "meta": asdict(meta),
             }
             labels_file.write(json.dumps(record, ensure_ascii=False) + "\n")
+            profiler.update(meta)
     _verify_counts(images_dir, labels_path, n)
+    summary = profiler.summary()
+    setting = STAGE_SETTINGS[stage]
+    if stage == "S3":
+        avg_len = summary["avg_length"]
+        if avg_len < setting.min_len - 0.5 or avg_len > setting.max_len + 0.5:
+            raise RuntimeError(f"S3 average length {avg_len:.2f} outside [{setting.min_len}, {setting.max_len}]")
+    if stage == "S4" and summary.get("avg_word_count") is not None and setting.word_count:
+        avg_wc = summary["avg_word_count"]
+        if avg_wc is not None and (avg_wc < setting.word_count[0] - 0.5 or avg_wc > setting.word_count[1] + 0.5):
+            raise RuntimeError(
+                f"S4 average word count {avg_wc:.2f} outside {setting.word_count}"
+            )
+    if profile:
+        print(json.dumps({"stage": stage, "profile": summary}, ensure_ascii=False, indent=2))
+    return summary
 
 
 def _verify_counts(images_dir: Path, labels_path: Path, expected: int) -> None:
