@@ -27,6 +27,8 @@ CHAR_TO_INDEX: Dict[str, int] = {
     symbol: index for index, symbol in enumerate(SYMBOLS) if symbol
 }
 NUM_CLASSES = len(SYMBOLS)
+VALID_CLASS_INDICES: Tuple[int, ...] = tuple(idx for idx, symbol in enumerate(SYMBOLS) if symbol)
+KD_TEMPERATURE = 1.5
 
 
 def text_to_indices(text: str) -> List[int]:
@@ -125,12 +127,39 @@ class TrainSample:
     text: str
 
 
+class ReplayBuffer:
+    """Circular buffer that stores a small cache of previous-stage samples."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("Replay buffer capacity must be positive")
+        self.capacity = capacity
+        self._items: List[TrainSample] = []
+
+    def add(self, sample: TrainSample) -> None:
+        if len(self._items) >= self.capacity:
+            self._items.pop(0)
+        self._items.append(sample)
+
+    def sample(self, rng: Random) -> TrainSample:
+        if not self._items:
+            raise ValueError("Replay buffer is empty")
+        return rng.choice(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def is_empty(self) -> bool:
+        return not self._items
+
+
 @dataclass
 class LossBreakdown:
     total: float
     main: float
     smooth: float
     grad_logits: List[List[float]]
+    kd: float = 0.0
     cer: float | None = None
     wer: float | None = None
 
@@ -154,6 +183,7 @@ def build_loader(
     batch_size: int,
     rng: Random,
     replay_ratio: float,
+    buffers: Dict[str, ReplayBuffer] | None = None,
 ) -> Generator[List[TrainSample], None, None]:
     def _generator() -> Generator[List[TrainSample], None, None]:
         for _ in range(steps):
@@ -161,11 +191,36 @@ def build_loader(
             for _ in range(batch_size):
                 chosen_stage = mix_replay(stage_cfg, rng, replay_ratio)
                 sampler = samplers[chosen_stage]
+                if buffers and chosen_stage in buffers and not buffers[chosen_stage].is_empty():
+                    batch.append(buffers[chosen_stage].sample(rng))
+                    continue
                 gray, text = sampler.next_sample()
-                batch.append(TrainSample(stage=chosen_stage, gray=gray, text=text))
+                sample = TrainSample(stage=chosen_stage, gray=gray, text=text)
+                batch.append(sample)
+                if buffers and chosen_stage in buffers:
+                    buffers[chosen_stage].add(sample)
             yield batch
 
     return _generator()
+
+
+def prepare_replay_buffers(
+    stage_cfg: StageConfig,
+    samplers: Dict[str, StageSampler],
+    batch_size: int,
+    replay_ratio: float,
+) -> Dict[str, ReplayBuffer]:
+    if replay_ratio <= 0.0 or not stage_cfg.previous:
+        return {}
+    capacity = max(4, int(batch_size * max(0.05, replay_ratio) * 2))
+    buffers: Dict[str, ReplayBuffer] = {}
+    for prev in stage_cfg.previous:
+        buffer = ReplayBuffer(capacity)
+        for _ in range(capacity):
+            gray, text = samplers[prev].next_sample()
+            buffer.add(TrainSample(stage=prev, gray=gray, text=text))
+        buffers[prev] = buffer
+    return buffers
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +271,30 @@ def merge_low_information(sequence: List[List[float]], max_merge: int = 4) -> Li
             groups.append(column[:])
             counts.append(1)
     return groups
+
+
+def classify_single_token(logits: Sequence[Sequence[float]]) -> str:
+    if not logits:
+        return ""
+    accumulator = [0.0 for _ in range(NUM_CLASSES)]
+    for step in logits:
+        probs = softmax(step)
+        for idx, value in enumerate(probs):
+            accumulator[idx] += value
+    if not VALID_CLASS_INDICES:
+        return ""
+    best = max(VALID_CLASS_INDICES, key=lambda idx: accumulator[idx])
+    return SYMBOLS[best]
+
+
+def decode_prediction(stage_name: str, logits: Sequence[Sequence[float]]) -> str:
+    stage_name = stage_name.upper()
+    cfg = STAGE_CONFIGS.get(stage_name)
+    if cfg is None:
+        return ""
+    if cfg.loss_type == "ce":
+        return classify_single_token(logits)
+    return ctc.greedy_decode(logits, blank=BLANK_INDEX)
 
 
 def tet_weights(length: int, mode: str) -> List[float]:
@@ -647,6 +726,41 @@ def softmax(logits: Sequence[float]) -> List[float]:
     return [value / denom for value in exps]
 
 
+def softmax_with_temperature(logits: Sequence[float], temperature: float) -> List[float]:
+    if temperature <= 0:
+        raise ValueError("Temperature must be positive for softmax.")
+    scaled = [value / temperature for value in logits]
+    return softmax(scaled)
+
+
+def knowledge_distillation_loss(
+    student: Sequence[Sequence[float]],
+    teacher: Sequence[Sequence[float]],
+    temperature: float,
+) -> Tuple[float, List[List[float]]]:
+    if len(student) != len(teacher):
+        raise ValueError("Teacher and student logits must align in time dimension")
+    if not student:
+        return 0.0, []
+    grads: List[List[float]] = []
+    total = 0.0
+    scale = temperature * temperature
+    for stud_step, teach_step in zip(student, teacher):
+        teacher_probs = softmax_with_temperature(teach_step, temperature)
+        student_probs = softmax_with_temperature(stud_step, temperature)
+        step_loss = 0.0
+        step_grad: List[float] = []
+        for sp, tp in zip(student_probs, teacher_probs):
+            sp_clamped = max(sp, 1e-12)
+            tp_clamped = max(tp, 1e-12)
+            step_loss += tp_clamped * math.log(tp_clamped / sp_clamped)
+            step_grad.append((sp - tp) * scale)
+        grads.append(step_grad)
+        total += step_loss
+    avg_loss = total / max(1, len(student))
+    return avg_loss, grads
+
+
 def cross_entropy_sequence(
     logits: List[List[float]],
     target_index: int,
@@ -744,13 +858,25 @@ def compute_loss_for_sample(
     logits: List[List[float]],
     text: str,
     sample_cfg: StageConfig,
+    *,
+    teacher_logits: List[List[float]] | None = None,
+    distill_lambda: float = 0.0,
+    kd_temperature: float = KD_TEMPERATURE,
 ) -> LossBreakdown:
+    kd_total = 0.0
     if sample_cfg.loss_type == "ce":
         indices = text_to_indices(text)
         if not indices:
             raise ValueError("Classification samples require at least one target symbol")
         total, grad_logits = cross_entropy_sequence(logits, indices[0], sample_cfg.tet_mode)
-        return LossBreakdown(total=total, main=total, smooth=0.0, grad_logits=grad_logits)
+        if teacher_logits is not None and distill_lambda > 0.0:
+            kd_loss, kd_grad = knowledge_distillation_loss(logits, teacher_logits, kd_temperature)
+            kd_total = distill_lambda * kd_loss
+            for t in range(len(grad_logits)):
+                for k in range(len(grad_logits[t])):
+                    grad_logits[t][k] += distill_lambda * kd_grad[t][k]
+            total += kd_total
+        return LossBreakdown(total=total, main=total - kd_total, smooth=0.0, grad_logits=grad_logits, kd=kd_total)
     target = text_to_indices(text)
     total, main, smooth, grad_logits = ctc_with_regularization(
         logits,
@@ -758,12 +884,20 @@ def compute_loss_for_sample(
         sample_cfg.tet_mode,
         sample_cfg.smoothing_lambda,
     )
+    if teacher_logits is not None and distill_lambda > 0.0:
+        kd_loss, kd_grad = knowledge_distillation_loss(logits, teacher_logits, kd_temperature)
+        kd_total = distill_lambda * kd_loss
+        for t in range(len(grad_logits)):
+            for k in range(len(grad_logits[t])):
+                grad_logits[t][k] += distill_lambda * kd_grad[t][k]
+        total += kd_total
     decoded = ctc.greedy_decode(logits, blank=BLANK_INDEX)
     return LossBreakdown(
         total=total,
         main=main,
         smooth=smooth,
         grad_logits=grad_logits,
+        kd=kd_total,
         cer=compute_cer(text, decoded),
         wer=compute_wer(text, decoded),
     )
@@ -791,6 +925,9 @@ class TrainArgs:
     log_every: int
     save_every: int
     seed: int
+    distill: bool
+    distill_lambda: float
+    teacher_ckpt: Path | None
 
 
 @dataclass
@@ -843,6 +980,8 @@ def run_epoch(
     ckpt_path: Path,
     samplers: Dict[str, StageSampler],
     rng: Random,
+    teacher_model: CurriculumModel | None,
+    kd_lambda: float,
 ) -> Tuple[int, float | None, float | None]:
     first_loss: float | None = None
     last_loss: float | None = None
@@ -859,17 +998,29 @@ def run_epoch(
         wer_total = 0.0
         cer_count = 0
         sample_count = 0
+        total_kd = 0.0
+        old_correct = 0
+        old_total = 0
         for sample in batch:
             sequence = image_to_sequence(sample.gray)
             if not sequence:
                 continue
             logits = model.forward(sequence)
-            breakdown = compute_loss_for_sample(logits, sample.text, STAGE_CONFIGS[sample.stage])
+            apply_kd = teacher_model is not None and sample.stage == stage and kd_lambda > 0.0
+            teacher_logits = teacher_model.forward(sequence) if apply_kd and teacher_model else None
+            breakdown = compute_loss_for_sample(
+                logits,
+                sample.text,
+                STAGE_CONFIGS[sample.stage],
+                teacher_logits=teacher_logits,
+                distill_lambda=kd_lambda if apply_kd else 0.0,
+            )
             grad_params = model.backward(breakdown.grad_logits)
             add_grad(grad_accum, grad_params)
             total_loss += breakdown.total
             total_main += breakdown.main
             total_smooth += breakdown.smooth
+            total_kd += breakdown.kd
             if breakdown.cer is not None and breakdown.wer is not None:
                 cer_total += breakdown.cer
                 wer_total += breakdown.wer
@@ -878,6 +1029,12 @@ def run_epoch(
             width = len(sample.gray[0]) if sample.gray and sample.gray[0] else 1
             total_width_ratio += len(sequence) / max(1, width)
             sample_count += 1
+            if sample.stage != stage:
+                prediction = decode_prediction(sample.stage, logits)
+                target_text = sample.text[0] if (sample.text and STAGE_CONFIGS[sample.stage].loss_type == "ce") else sample.text
+                if prediction == target_text:
+                    old_correct += 1
+                old_total += 1
         if sample_count == 0:
             continue
         inv_batch = 1.0 / sample_count
@@ -886,10 +1043,12 @@ def run_epoch(
         batch_loss = total_loss * inv_batch
         batch_main = total_main * inv_batch
         batch_smooth = total_smooth * inv_batch
+        batch_kd = total_kd * inv_batch
         avg_fire = total_fire * inv_batch
         avg_width_ratio = total_width_ratio * inv_batch
         avg_cer = (cer_total / cer_count) if cer_count else None
         avg_wer = (wer_total / cer_count) if cer_count else None
+        old_top1 = (old_correct / old_total) if old_total else None
         grad_norm_before = grad_norm(grad_accum)
         grad_norm_after = clip_gradient(grad_accum, clip_grad)
         if isinstance(optimizer, (SGDOptimizer, AdamOptimizer)):
@@ -904,27 +1063,60 @@ def run_epoch(
                 "loss": batch_loss,
                 "main_loss": batch_main,
                 "smooth_loss": batch_smooth,
+                "kd_loss": batch_kd,
                 "lr": lr,
                 "grad_norm": grad_norm_before,
                 "grad_norm_clipped": grad_norm_after,
-                "spikes_rate": avg_fire,
-                "W_to_Wp": avg_width_ratio,
+                "fire_rate": avg_fire,
+                "width_ratio": avg_width_ratio,
             }
-            if avg_cer is not None and avg_wer is not None:
+            if avg_cer is not None:
                 log_entry["cer"] = avg_cer
+            if avg_wer is not None:
                 log_entry["wer"] = avg_wer
+            if old_top1 is not None:
+                log_entry["old_top1"] = old_top1
             metrics_file.write(json.dumps(log_entry) + "\n")
             metrics_file.flush()
-            extra = ""
-            if avg_cer is not None and avg_wer is not None:
-                extra = f" cer={avg_cer:.3f} wer={avg_wer:.3f}"
-            print(
-                f"[iter {global_step}] stage={stage} loss={batch_loss:.4f} main={batch_main:.4f} "
-                f"smooth={batch_smooth:.4f} lr={lr:.5f} fire={avg_fire:.3f} W->W'={avg_width_ratio:.2f}{extra}"
+            msg = (
+                f"[step {global_step}] loss={batch_loss:.4f} main={batch_main:.4f} smooth={batch_smooth:.4f} "
+                f"lr={lr:.5f} fire={avg_fire:.3f} W'={avg_width_ratio:.2f}"
             )
+            if batch_kd > 0.0:
+                msg += f" kd={batch_kd:.4f}"
+            if avg_cer is not None:
+                msg += f" cer={avg_cer:.3f}"
+            if avg_wer is not None:
+                msg += f" wer={avg_wer:.3f}"
+            if old_top1 is not None:
+                msg += f" old={old_top1:.3f}"
+            print(msg)
         if global_step % save_every == 0:
             save_ckpt(ckpt_path, model, optimizer, global_step, samplers, rng)
     return global_step, first_loss, last_loss
+
+
+def find_teacher_checkpoint(stage_cfg: StageConfig, out_dir: Path, override: Path | None) -> Path | None:
+    if override is not None:
+        return override
+    base = out_dir.parent
+    for prev in reversed(stage_cfg.previous):
+        candidate = base / prev.lower() / "ckpt.json"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def load_model_weights(path: Path | None, model: CurriculumModel) -> bool:
+    if path is None or not path.exists():
+        return False
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    state = payload.get("model")
+    if isinstance(state, dict):
+        model.load_state_dict(state)
+        return True
+    return False
 
 
 def train_stage(args: TrainArgs) -> TrainingResult:
@@ -964,6 +1156,19 @@ def train_stage(args: TrainArgs) -> TrainingResult:
     replay_ratio = (
         args.replay_override if args.replay_override is not None else stage_cfg.replay_ratio
     )
+    buffers = prepare_replay_buffers(stage_cfg, samplers, args.batch_size, replay_ratio)
+    teacher_model: CurriculumModel | None = None
+    if args.distill and stage_cfg.previous:
+        teacher_path = find_teacher_checkpoint(stage_cfg, out_dir, args.teacher_ckpt)
+        if teacher_path is None:
+            print("[distill] No prior checkpoint found; skipping knowledge distillation.")
+        else:
+            teacher_model = CurriculumModel(feature_dim=5, output_dim=NUM_CLASSES, seed=args.seed + 97)
+            if load_model_weights(teacher_path, teacher_model):
+                print(f"[distill] Loaded teacher checkpoint from {teacher_path}")
+            else:
+                print(f"[distill] Failed to load teacher from {teacher_path}, disabling KD.")
+                teacher_model = None
 
     def lr_fn(step: int) -> float:
         if not args.cosine_anneal:
@@ -979,6 +1184,7 @@ def train_stage(args: TrainArgs) -> TrainingResult:
                 batch_size=args.batch_size,
                 rng=rng,
                 replay_ratio=replay_ratio,
+                buffers=buffers,
             )
             global_step, first_loss, last_loss = run_epoch(
                 model,
@@ -996,6 +1202,8 @@ def train_stage(args: TrainArgs) -> TrainingResult:
                 ckpt_path=ckpt_path,
                 samplers=samplers,
                 rng=rng,
+                teacher_model=teacher_model,
+                kd_lambda=args.distill_lambda if teacher_model is not None else 0.0,
             )
             if result.initial_loss is None and first_loss is not None:
                 result.initial_loss = first_loss
@@ -1090,6 +1298,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=200)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--distill", action="store_true", help="Enable lightweight LwF knowledge distillation.")
+    parser.add_argument(
+        "--distill-lambda",
+        type=float,
+        default=0.3,
+        help="Weight for the KD term when --distill is active.",
+    )
+    parser.add_argument("--teacher", type=Path, default=None, help="Optional explicit teacher checkpoint.")
     parser.add_argument("--demo", action="store_true", help="Run a short S1 demo.")
     return parser.parse_args()
 
@@ -1112,6 +1328,9 @@ def run_demo() -> None:
         log_every=5,
         save_every=1000,
         seed=3,
+        distill=False,
+        distill_lambda=0.0,
+        teacher_ckpt=None,
     )
     result = train_stage(demo_args)
     if result.initial_loss is not None and result.final_loss is not None:
@@ -1143,6 +1362,9 @@ def main() -> None:
         log_every=args_ns.log_every,
         save_every=args_ns.save_every,
         seed=args_ns.seed,
+        distill=args_ns.distill,
+        distill_lambda=args_ns.distill_lambda,
+        teacher_ckpt=args_ns.teacher,
     )
     train_stage(train_args)
 

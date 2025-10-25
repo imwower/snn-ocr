@@ -40,6 +40,9 @@ def cmd_train(ns: argparse.Namespace) -> None:
         log_every=ns.log_every,
         save_every=ns.save_every,
         seed=ns.seed,
+        distill=ns.distill,
+        distill_lambda=ns.distill_lambda,
+        teacher_ckpt=Path(ns.teacher) if ns.teacher else None,
     )
     result = train_stage(train_args)
     print(
@@ -134,6 +137,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser_train.add_argument("--log-every", type=int, default=10)
     parser_train.add_argument("--save-every", type=int, default=200)
     parser_train.add_argument("--seed", type=int, default=7)
+    parser_train.add_argument("--distill", action="store_true", help="Enable knowledge distillation (LwF).")
+    parser_train.add_argument(
+        "--distill-lambda",
+        type=float,
+        default=0.3,
+        help="Weight for the KD term when --distill is enabled.",
+    )
+    parser_train.add_argument(
+        "--teacher",
+        type=str,
+        default=None,
+        help="Optional explicit checkpoint path to use as the distillation teacher.",
+    )
     parser_train.set_defaults(func=cmd_train)
 
     parser_eval = subparsers.add_parser("eval", help="Evaluate a checkpoint.")
