@@ -48,6 +48,13 @@ class SequenceHeadTest(unittest.TestCase):
         self.assertEqual(len(out_attn[0][0]), len(self.sample[0][0]))
         self.assertEqual(len(out_no_attn[0][0]), len(self.sample[0][0]))
 
+    def test_blockwise_merge_reduces_flat_regions(self) -> None:
+        sequence = [[0.1, 0.1, 0.1, 0.1, float(idx)] for idx in range(10)]
+        sequence[5] = [0.9, 0.2, 0.8, 0.1, 5.0]
+        merged = seq.merge_columns_blockwise(sequence, max_merge=3, window=3)
+        self.assertLess(len(merged), len(sequence))
+        self.assertEqual(len(merged[0]), len(sequence[0]))
+
 
 if __name__ == "__main__":
     unittest.main()

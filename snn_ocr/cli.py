@@ -93,7 +93,7 @@ def cmd_eval(ns: argparse.Namespace) -> None:
 
 
 def cmd_preview(ns: argparse.Namespace) -> None:
-    text = ns.text
+    text = ns.text.replace("\\n", "\n")
     width = ns.width
     height = ns.height
     ascii_out = ns.ascii
@@ -162,7 +162,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser_eval.set_defaults(func=cmd_eval)
 
     parser_preview = subparsers.add_parser("preview", help="Render text to a PGM and/or ASCII.")
-    parser_preview.add_argument("--text", type=str, required=True)
+    parser_preview.add_argument(
+        "--text",
+        type=str,
+        required=True,
+        help="Text to render (use \\n for explicit newlines)",
+    )
     parser_preview.add_argument("--width", type=int, default=128)
     parser_preview.add_argument("--height", type=int, default=32)
     parser_preview.add_argument("--jitter", type=int, default=1)

@@ -46,6 +46,14 @@ class RenderTest(unittest.TestCase):
         preview = render.ascii_preview(canvas)
         self.assertEqual(preview, " @\n@ ")
 
+    def test_multiline_rendering(self) -> None:
+        canvas = render.render_text("LINE1\nLINE2", 160, 64, jitter=0, noise=0.0)
+        midpoint = max(1, len(canvas) // 2)
+        top_active = any(any(value > 0 for value in row) for row in canvas[:midpoint])
+        bottom_active = any(any(value > 0 for value in row) for row in canvas[midpoint:])
+        self.assertTrue(top_active)
+        self.assertTrue(bottom_active)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,7 +16,7 @@ DIGITS = "0123456789"
 LETTERS_UP = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 LETTERS_LO = LETTERS_UP.lower()
 PUNCT = ".,!?"
-ALLOWED_CHARS = set(DIGITS + LETTERS_UP + LETTERS_LO + PUNCT + " ")
+ALLOWED_CHARS = set(DIGITS + LETTERS_UP + LETTERS_LO + PUNCT + " \n")
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,8 @@ class StageSetting:
     foreground_range: Tuple[int, int] = (255, 255)
     punctuation: str = ""
     punctuation_prob: float = 0.0
+    allow_newline: bool = False
+    newline_prob: float = 0.0
 
 
 STAGE_SETTINGS: Dict[str, StageSetting] = {
@@ -111,6 +113,8 @@ STAGE_SETTINGS: Dict[str, StageSetting] = {
         foreground_range=(190, 250),
         punctuation=PUNCT,
         punctuation_prob=0.75,
+        allow_newline=True,
+        newline_prob=0.5,
     ),
 }
 
@@ -151,9 +155,27 @@ def _sample_text(stage: str, setting: StageSetting, rng: Random) -> str:
             if rng.random() < 0.2:
                 word = word.upper()
             words.append(word)
-        sentence = " ".join(words)
-        sentence = sentence.capitalize()
+        tokens: List[str] = words[:]
+        if (
+            setting.allow_newline
+            and len(tokens) >= 2
+            and rng.random() < setting.newline_prob
+        ):
+            split = rng.randint(1, len(tokens) - 1)
+            tokens.insert(split, "\n")
+        parts: List[str] = []
+        for idx, token in enumerate(tokens):
+            if token == "\n":
+                parts.append("\n")
+                continue
+            parts.append(token)
+            if idx != len(tokens) - 1 and tokens[idx + 1] != "\n":
+                parts.append(" ")
+        sentence = "".join(parts)
+        lines = sentence.split("\n")
+        sentence = "\n".join(line[:1].upper() + line[1:] if line else line for line in lines)
         if setting.punctuation and rng.random() < setting.punctuation_prob:
+            sentence = sentence.rstrip(" ")
             sentence += rng.choice(setting.punctuation)
         return sentence
     raise KeyError(f"Unsupported stage mode {mode!r}")

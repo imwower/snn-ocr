@@ -13,7 +13,7 @@ SYMBOLS: Tuple[str, ...] = tuple(
     + list("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
     + list("abcdefghijklmnopqrstuvwxyz")
     + list("0123456789")
-    + [" ", ".", ",", "!", "?"]
+    + [" ", ".", ",", "!", "?", "\n"]
 )
 
 

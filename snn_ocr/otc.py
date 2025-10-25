@@ -94,15 +94,18 @@ def compress_height(
         raise ValueError("max_merge must be positive")
     reduced, original_width = _reduce_height(features, target_h=target_h)
     info_values = _column_information(features, gate=gate)
-    mean_info = sum(info_values) / (len(info_values) or 1)
     groups: List[List[List[float]]] = []
     counts: List[int] = []
     columns: List[List[int]] = []
+    window = max(1, max_merge * 2)
     for w in range(original_width):
         column_vectors = [reduced[t][w][:] for t in range(len(reduced))]
+        start = max(0, w - window + 1)
+        local_slice = info_values[start : w + 1]
+        local_mean = sum(local_slice) / len(local_slice)
         if (
             groups
-            and info_values[w] <= mean_info
+            and info_values[w] <= local_mean
             and counts[-1] < max_merge
         ):
             prev_count = counts[-1]

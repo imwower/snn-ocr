@@ -14,7 +14,7 @@ import sys
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from snn_ocr import ctc, synth, spikes
+from snn_ocr import ctc, seq as seq_utils, synth, spikes
 
 
 # ---------------------------------------------------------------------------
@@ -244,33 +244,7 @@ def image_to_sequence(gray: List[List[int]]) -> List[List[float]]:
         variance = sum((value - mean) ** 2 for value in column) / height
         position = w / max(1, width - 1)
         sequence.append([mean, top, bottom, variance, position])
-    return merge_low_information(sequence)
-
-
-def merge_low_information(sequence: List[List[float]], max_merge: int = 4) -> List[List[float]]:
-    """Collapse adjacent low-information columns to approximate OTC behaviour."""
-    if not sequence:
-        return []
-    info_scores: List[float] = []
-    for column in sequence:
-        mean = sum(column[:-1]) / max(1, len(column) - 1)  # exclude position
-        variance = sum((value - mean) ** 2 for value in column[:-1]) / max(1, len(column) - 1)
-        info_scores.append(variance)
-    threshold = sum(info_scores) / max(1, len(info_scores))
-    groups: List[List[float]] = []
-    counts: List[int] = []
-    for idx, column in enumerate(sequence):
-        if groups and info_scores[idx] <= threshold and counts[-1] < max_merge:
-            prev_count = counts[-1]
-            combined = groups[-1]
-            new_count = prev_count + 1
-            for i in range(len(combined)):
-                combined[i] = (combined[i] * prev_count + column[i]) / new_count
-            counts[-1] = new_count
-        else:
-            groups.append(column[:])
-            counts.append(1)
-    return groups
+    return seq_utils.merge_columns_blockwise(sequence, max_merge=4, window=24)
 
 
 def classify_single_token(logits: Sequence[Sequence[float]]) -> str:

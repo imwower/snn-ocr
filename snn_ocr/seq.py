@@ -159,6 +159,56 @@ def linear_attention(
     return result
 
 
+def merge_columns_blockwise(
+    sequence: List[List[float]],
+    *,
+    max_merge: int = 4,
+    window: int = 16,
+) -> List[List[float]]:
+    """Merge adjacent low-information columns using a sliding window threshold."""
+    if not sequence:
+        return []
+    if max_merge <= 0:
+        return [column[:] for column in sequence]
+    feature_dim = len(sequence[0])
+    info_scores: List[float] = []
+    for column in sequence:
+        values = column[:-1] if len(column) > 1 else column[:]
+        if not values:
+            info_scores.append(0.0)
+            continue
+        mean = sum(values) / len(values)
+        variance = sum((value - mean) ** 2 for value in values) / len(values)
+        info_scores.append(variance)
+    window = max(1, window)
+
+    def local_threshold(idx: int) -> float:
+        start = max(0, idx - window + 1)
+        subset = info_scores[start : idx + 1]
+        return sum(subset) / max(1, len(subset))
+
+    merged: List[List[float]] = []
+    counts: List[int] = []
+    for idx, column in enumerate(sequence):
+        if (
+            merged
+            and info_scores[idx] <= local_threshold(idx)
+            and counts[-1] < max_merge
+        ):
+            prev_count = counts[-1]
+            combined = merged[-1]
+            new_count = prev_count + 1
+            if len(combined) != len(column):
+                raise ValueError("Feature dimension changed within sequence")
+            for dim in range(feature_dim):
+                combined[dim] = (combined[dim] * prev_count + column[dim]) / new_count
+            counts[-1] = new_count
+        else:
+            merged.append(column[:])
+            counts.append(1)
+    return merged
+
+
 class SpikingSeqHead:
     """Two-layer spike sequence head with optional lightweight attention."""
 

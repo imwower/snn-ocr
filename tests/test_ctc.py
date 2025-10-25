@@ -63,6 +63,7 @@ class CtcTest(unittest.TestCase):
         symbols = ctc.symbol_table()
         self.assertIn(".", symbols)
         self.assertIn("!", symbols)
+        self.assertIn("\n", symbols)
 
     def test_ctc_loss_handles_empty_target(self) -> None:
         logits = [
