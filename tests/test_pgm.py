@@ -58,6 +58,19 @@ class PgmIoTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pgm.load_pgm(path)
 
+    def test_load_pgm_tolerates_comments_and_spaces(self) -> None:
+        pattern = [
+            [0, 255],
+            [255, 0],
+        ]
+        payload = bytes(value for row in pattern for value in row)
+        header = b"P5\n# comment about image\n 2 2  \n255\n"
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "comment.pgm"
+            path.write_bytes(header + payload)
+            loaded = pgm.load_pgm(path)
+            self.assertEqual(loaded, pattern)
+
 
 if __name__ == "__main__":
     unittest.main()

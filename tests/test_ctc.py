@@ -120,6 +120,42 @@ class CtcTest(unittest.TestCase):
         self.assertEqual(decoded_greedy, "AA")
         self.assertEqual(decoded_beam, "AA")
 
+    def test_best_alignment_path_handles_empty_target(self) -> None:
+        logits = [[4.0, 0.5], [4.2, 0.4], [3.8, 0.3]]
+        path = ctc.best_alignment_path(logits, [], blank=0)
+        self.assertEqual(len(path), len(logits))
+        self.assertTrue(all(index == 0 for index in path))
+
+    def test_long_sequence_alignment_remains_stable(self) -> None:
+        text = "AB" * 8
+        logits = []
+        for ch in text:
+            if ch == "A":
+                logits.append([0.1, 5.0, 0.1])
+            else:
+                logits.append([0.1, 0.1, 5.0])
+            logits.append([5.0, 0.1, 0.1])  # encourage blank separation
+        greedy = ctc.greedy_decode(logits, blank=0)
+        beam = ctc.beam_search(logits, beam=4, blank=0)
+        self.assertEqual(greedy, text)
+        self.assertEqual(beam, text)
+        target = [1 if ch == "A" else 2 for ch in text]
+        path = ctc.best_alignment_path(logits, target, blank=0)
+        self.assertEqual(len(path), len(logits))
+        loss = ctc.ctc_loss(logits, target, blank=0)
+        self.assertGreater(loss, 0.0)
+
+    def test_repeated_alignment_contains_blanks(self) -> None:
+        logits = [
+            [0.3, 4.0, 0.2],
+            [4.0, 0.1, 0.1],
+            [0.2, 4.1, 0.2],
+        ]
+        target = [1, 1]
+        path = ctc.best_alignment_path(logits, target, blank=0)
+        self.assertIn(0, path)
+        self.assertEqual(len(path), len(logits))
+
 
 if __name__ == "__main__":
     unittest.main()

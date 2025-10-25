@@ -155,6 +155,28 @@ class LifModuleTest(unittest.TestCase):
         self.assertAlmostEqual(center, lif.surrogate_grad(-0.0, width=0.5))
         self.assertLess(lif.surrogate_grad(0.25, width=0.5), center)
 
+    def test_membrane_resets_after_spike(self) -> None:
+        neuron = lif.LIF(alpha=0.0, v_th=1.0, v_reset=0.2)
+        v, spike = neuron.step(1.0)
+        self.assertEqual(spike, 1)
+        self.assertAlmostEqual(v, neuron.v_reset)
+        neuron.reset()
+        self.assertAlmostEqual(neuron.v, neuron.v_reset)
+
+    def test_lif_accumulates_until_threshold(self) -> None:
+        neuron = lif.LIF(alpha=0.8, v_th=0.9, v_reset=0.1)
+        spikes = []
+        potentials = []
+        for current in (0.2, 0.2, 0.2, 0.6):
+            v, spike = neuron.step(current)
+            potentials.append(v)
+            spikes.append(spike)
+        self.assertIn(1, spikes)
+        spike_index = spikes.index(1)
+        if spike_index > 0:
+            self.assertLess(potentials[spike_index - 1], neuron.v_th)
+        self.assertGreaterEqual(potentials[spike_index], neuron.v_reset)
+
 
 if __name__ == "__main__":
     unittest.main()
